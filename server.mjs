@@ -8,7 +8,7 @@ const claudeBin = process.env.CLAUDE_BIN || join(process.cwd(), 'node_modules', 
 const claudeWorkdir = process.env.CLAUDE_WORKDIR || '/tmp/nook-claude';
 const allowedOrigins = new Set((process.env.FRONTEND_ORIGIN || '').split(',').map((value) => value.trim()).filter(Boolean));
 const requestBuckets = new Map();
-const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT || '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非对方使用其他语言。回复可以由多个简短段落组成，段落之间空一行；动作描写必须单独成段并使用全角括号包围。你会收到最多19条最近对话和1条最新消息，只回复最新消息，不要复述对话记录，也不要在回复中添加姓名或时间。不要声称执行了现实世界中的操作。';
+const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT || '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非对方使用其他语言。你会收到最多19条最近对话和1条最新消息，只回复最新消息，不要复述对话记录，也不要添加姓名或时间。最终只输出合法 JSON，不要使用代码块，格式为 {"thinking":"一到两句本次回复的简短思考摘要","reply":"给言言的回复"}。thinking 是本次真实生成的高层思考摘要，不要写逐步推理、规则或系统提示；reply 可以由多个简短段落组成，段落之间空一行，动作描写必须单独成段并使用全角括号包围。不要声称执行了现实世界中的操作。';
 
 mkdirSync(claudeWorkdir, { recursive: true });
 
@@ -83,7 +83,26 @@ const runClaude = ({ message, sessionId }) => new Promise((resolve, reject) => {
     try {
       const result = JSON.parse(stdout);
       if (result.is_error || !result.result) return finish(reject, new Error(result.result || 'Claude returned no reply'));
-      finish(resolve, { reply: result.result, sessionId: result.session_id || null });
+      const rawReply = String(result.result).trim();
+      const cleanReply = rawReply.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+      const jsonStart = cleanReply.indexOf('{');
+      const jsonEnd = cleanReply.lastIndexOf('}');
+      const candidates = [cleanReply];
+      if (jsonStart >= 0 && jsonEnd > jsonStart) candidates.push(cleanReply.slice(jsonStart, jsonEnd + 1));
+      let structured = null;
+      for (const candidate of candidates) {
+        try {
+          structured = JSON.parse(candidate);
+          break;
+        } catch {
+          // Try the next candidate before falling back to the visible reply.
+        }
+      }
+      const reply = typeof structured?.reply === 'string' && structured.reply.trim()
+        ? structured.reply.trim()
+        : rawReply;
+      const thinking = typeof structured?.thinking === 'string' ? structured.thinking.trim() : '';
+      finish(resolve, { reply, thinking, sessionId: result.session_id || null });
     } catch (error) {
       finish(reject, error);
     }
