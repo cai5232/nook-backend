@@ -47,9 +47,8 @@ const runClaude = ({ message, sessionId }) => new Promise((resolve, reject) => {
     '-p',
     '--output-format', 'json',
     '--max-turns', '1',
-    '--permission-prompts', 'none',
-    '--disable-slash-commands',
-    '--no-chrome',
+    '--tools', '',
+    '--permission-mode', 'dontAsk',
     '--system-prompt', systemPrompt,
   ];
   if (process.env.CLAUDE_MODEL) args.push('--model', process.env.CLAUDE_MODEL);
