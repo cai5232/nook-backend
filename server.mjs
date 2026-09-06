@@ -8,7 +8,7 @@ const claudeBin = process.env.CLAUDE_BIN || join(process.cwd(), 'node_modules', 
 const claudeWorkdir = process.env.CLAUDE_WORKDIR || '/tmp/nook-claude';
 const allowedOrigins = new Set((process.env.FRONTEND_ORIGIN || '').split(',').map((value) => value.trim()).filter(Boolean));
 const requestBuckets = new Map();
-const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT || '你是 Claude，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非对方使用其他语言。不要声称执行了现实世界中的操作。';
+const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT || '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非对方使用其他语言。回复可以由多个简短段落组成，段落之间空一行；动作描写必须单独成段并使用全角括号包围。不要声称执行了现实世界中的操作。';
 
 mkdirSync(claudeWorkdir, { recursive: true });
 
