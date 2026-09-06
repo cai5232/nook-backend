@@ -8,7 +8,7 @@ const claudeBin = process.env.CLAUDE_BIN || join(process.cwd(), 'node_modules', 
 const claudeWorkdir = process.env.CLAUDE_WORKDIR || '/tmp/nook-claude';
 const allowedOrigins = new Set((process.env.FRONTEND_ORIGIN || '').split(',').map((value) => value.trim()).filter(Boolean));
 const requestBuckets = new Map();
-const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT || '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非对方使用其他语言。回复可以由多个简短段落组成，段落之间空一行；动作描写必须单独成段并使用全角括号包围。不要声称执行了现实世界中的操作。';
+const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT || '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非对方使用其他语言。回复可以由多个简短段落组成，段落之间空一行；动作描写必须单独成段并使用全角括号包围。你会收到最多19条最近对话和1条最新消息，只回复最新消息，不要复述对话记录，也不要在回复中添加姓名或时间。不要声称执行了现实世界中的操作。';
 
 mkdirSync(claudeWorkdir, { recursive: true });
 
@@ -118,9 +118,18 @@ createServer(async (request, response) => {
   try {
     const body = await readJson(request);
     const message = typeof body.message === 'string' ? body.message.trim() : '';
-    const sessionId = typeof body.sessionId === 'string' && /^[a-zA-Z0-9-]{1,100}$/.test(body.sessionId) ? body.sessionId : null;
     if (!message || message.length > 4000) return sendJson(response, 400, { error: 'Message must be 1–4000 characters' }, origin);
-    const result = await runClaude({ message, sessionId });
+    const history = Array.isArray(body.history)
+      ? body.history.slice(-19).flatMap((entry) => {
+        const speaker = entry?.role === 'assistant' ? '沈屿' : entry?.role === 'user' ? '言言' : '';
+        const content = typeof entry?.content === 'string' ? entry.content.trim().slice(0, 2000) : '';
+        return speaker && content ? [`${speaker}：${content}`] : [];
+      })
+      : [];
+    const contextualMessage = history.length
+      ? `以下是最近的对话记录：\n\n${history.join('\n\n')}\n\n言言的新消息：${message}`
+      : message;
+    const result = await runClaude({ message: contextualMessage, sessionId: null });
     return sendJson(response, 200, result, origin);
   } catch (error) {
     console.error(error);
