@@ -47,8 +47,6 @@ const runClaude = ({ message, sessionId }) => new Promise((resolve, reject) => {
     '-p',
     '--output-format', 'json',
     '--max-turns', '1',
-    '--tools', '',
-    '--disallowedTools', 'mcp__*',
     '--permission-prompts', 'none',
     '--disable-slash-commands',
     '--no-chrome',
