@@ -15,7 +15,7 @@ Optional settings:
 - `CLAUDE_SYSTEM_PROMPT`: replacement chat persona.
 - `CLAUDE_BIN`: existing Claude executable path on the VPS, for example the output of `command -v claude`.
 - `CLAUDE_WORKDIR`: writable session directory; defaults to `/tmp/nook-claude`.
-- `NOCTURNE_MCP_URL`: Nocturne service root URL or full `/mcp` URL. When set, the backend automatically recalls and stores memory on every chat turn.
+- `NOCTURNE_MCP_URL`: Nocturne service root URL or full `/mcp` URL. When set, the backend recalls memory every turn and stores only memories selected by the model or scheduled 20-message timeline summaries.
 - `NOCTURNE_MCP_TOKEN`: optional Bearer token when the MCP endpoint is behind an authenticated reverse proxy.
 - `NOCTURNE_TIMEOUT_MS`: MCP request timeout; defaults to `8000`.
 - `NOCTURNE_RECALL_LIMIT`: related memories returned by `trace`; defaults to `8`.
@@ -25,9 +25,9 @@ Optional settings:
 ## Endpoints
 
 - `GET /health`
-- `POST /api/chat` with `{ "message": "...", "sessionId": "..." }`
+- `POST /api/chat` with `message`, up to 30 prior dialogue messages in `history`, and optional `compressContext` plus `compressionMessages` for a 20-message timeline boundary.
 
-The service runs Claude Code with no built-in tools and limits each request to one turn. Memory is handled deterministically by the backend through Nocturne's HTTP MCP endpoint instead of relying on Claude to choose a memory tool.
+The service runs Claude Code with no built-in tools and limits each request to one turn. Every request receives Beijing time, up to 15 prior dialogue rounds, and Nocturne's core plus related memories. Claude decides whether a durable fact is worth recording, while the backend performs all MCP reads and writes and exposes successful recall/store events to the frontend. Unfinished threads are stored as `unresolved`; every requested 20-message boundary is stored as a `window` timeline summary.
 
 The frontend service needs two environment variables:
 
