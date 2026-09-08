@@ -6,6 +6,7 @@ test('recalls and stores memory through Streamable HTTP MCP', async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
   globalThis.fetch = async (_url, options) => {
+    if (options.method === 'DELETE') return new Response(null, { status: 204 });
     const payload = JSON.parse(options.body);
     if (payload.method === 'initialize') {
       return new Response(JSON.stringify({
