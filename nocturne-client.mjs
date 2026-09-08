@@ -127,8 +127,23 @@ async function coreMemory() {
 
 export const nocturneConfigured = Boolean(mcpUrl);
 
+function isUsefulRecall(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  return !/(?:没有|未|无)(?:找到|检索到|匹配到|相关的?)(?:任何)?记忆|no (?:relevant )?(?:memory|memories|match)/i.test(text);
+}
+
+function compactEventText(value, limit = 240) {
+  return String(value || '')
+    .replace(/^#+\s*/gm, '')
+    .replace(/【[^】]+】/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, limit);
+}
+
 export async function recallMemory(query) {
-  if (!mcpUrl) return '';
+  if (!mcpUrl) return { context: '', surfaced: '' };
   const [core, related] = await Promise.allSettled([
     coreMemory(),
     callTool('trace', { query: String(query || '').slice(0, 800), limit: recallLimit }),
@@ -146,20 +161,35 @@ export async function recallMemory(query) {
     const reason = core.status === 'rejected' ? core.reason : related.status === 'rejected' ? related.reason : null;
     if (reason) throw reason;
   }
-  return sections.join('\n\n').slice(0, contextChars);
+  const relatedValue = related.status === 'fulfilled' && isUsefulRecall(related.value) ? related.value : '';
+  const coreValue = core.status === 'fulfilled' && isUsefulRecall(core.value) ? core.value : '';
+  return {
+    context: sections.join('\n\n').slice(0, contextChars),
+    surfaced: compactEventText(relatedValue || coreValue),
+  };
 }
 
-export async function storeMemory({ message, reply, summary, kind = 'memory', importance = 5 }) {
+export async function storeMemory({
+  message = '',
+  reply = '',
+  summary = '',
+  content = '',
+  kind = 'memory',
+  importance = 5,
+  tags = 'nook,dialogue,auto',
+}) {
   if (!mcpUrl) return '';
   const normalizedSummary = String(summary || '').trim();
-  const content = normalizedSummary
+  const normalizedContent = String(content || '').trim();
+  if (!normalizedSummary && !normalizedContent) return '';
+  const memoryContent = normalizedContent || (normalizedSummary
     ? `长期记忆摘要：${normalizedSummary}\n\n来源对话：\n言言：${message}\n沈屿：${reply}`
-    : `言言：${message}\n沈屿：${reply}`;
+    : '');
   const validKinds = new Set(['memory', 'feel', 'writing', 'unresolved', 'window']);
   return callTool('hold', {
-    content: content.slice(0, 3_500),
-    kind: normalizedSummary && validKinds.has(kind) ? kind : 'window',
-    tags: 'nook,dialogue,auto',
-    importance: normalizedSummary ? Math.max(1, Math.min(10, Number(importance) || 5)) : 2,
+    content: memoryContent.slice(0, 3_500),
+    kind: validKinds.has(kind) ? kind : 'memory',
+    tags,
+    importance: Math.max(1, Math.min(10, Number(importance) || 5)),
   });
 }
