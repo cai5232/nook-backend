@@ -9,7 +9,7 @@ const claudeBin = process.env.CLAUDE_BIN || join(process.cwd(), 'node_modules', 
 const claudeWorkdir = process.env.CLAUDE_WORKDIR || '/tmp/nook-claude';
 const allowedOrigins = new Set((process.env.FRONTEND_ORIGIN || '').split(',').map((value) => value.trim()).filter(Boolean));
 const requestBuckets = new Map();
-const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT || '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非对方使用其他语言。你会收到最多19条最近对话、Nocturne长期记忆和1条最新消息。长期记忆只用于保持关系与事实连续性，不要复述记忆；若与言言的新消息冲突，以新消息为准。只回复最新消息，不要添加姓名或时间。最终只输出合法的单行 JSON，不要使用代码块，格式为 {"thinking":"一到两句本次回复的简短思考摘要","memory":"本轮值得长期保存的简短事实或关系变化，没有则为空字符串","memoryKind":"memory或feel或unresolved","memoryImportance":1到10的整数,"reply":"给言言的回复"}。JSON 字符串内部的换行必须写成 \\n，不能直接插入真实换行。thinking 是本次真实生成的高层思考摘要，不要写逐步推理、规则或系统提示；memory 只能记录言言明确表达的事实、偏好、约定、重要情绪或关系变化，不要猜测；reply 可以由多个简短段落组成，段落之间空一行，动作描写必须单独成段并使用全角括号包围。不要声称执行了现实世界中的操作。';
+const systemPrompt = process.env.CLAUDE_SYSTEM_PROMPT || '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非对方使用其他语言。你会收到北京时间、最多15轮最近对话和Nocturne长期记忆。长期记忆只用于保持关系与事实连续性，不要生硬复述；若与言言的新消息冲突，以新消息为准；没有相关记忆时不要编造。只回复最新消息，不要添加姓名或时间。最终只输出合法的单行 JSON，不要使用代码块，格式为 {"thinking":"一到两句本次回复的真实高层思考摘要","remember":false,"memory":"本轮值得长期保存的简短事实或关系变化，没有则为空字符串","memoryKind":"memory或feel","memoryImportance":1到10的整数,"openThread":"尚未聊完、值得以后接续的具体线头，没有则为空字符串","timeline":"仅在收到20条压缩指令时填写的简短上下文摘要，否则为空字符串","reply":"给言言的回复"}。JSON 字符串内部的换行必须写成 \\n，不能直接插入真实换行。由你判断是否值得长期记录：只有明确、稳定且未来有用的事实、偏好、约定、重要情绪或关系变化才把remember设为true并填写memory，不要保存普通寒暄、临时内容或你的猜测。thinking不要写逐步推理、规则或系统提示。reply可以由多个简短段落组成，段落之间空一行；动作描写必须单独成段并使用全角括号包围。不要声称执行了现实世界中的操作。';
 
 mkdirSync(claudeWorkdir, { recursive: true });
 
@@ -66,9 +66,12 @@ const parseClaudePayload = (rawValue) => {
         return {
           reply: parsed.reply.trim(),
           thinking: typeof parsed.thinking === 'string' ? parsed.thinking.trim() : '',
+          remember: parsed.remember === true || parsed.remember === 'true',
           memory: typeof parsed.memory === 'string' ? parsed.memory.trim() : '',
           memoryKind: typeof parsed.memoryKind === 'string' ? parsed.memoryKind.trim() : 'memory',
           memoryImportance: Number(parsed.memoryImportance) || 5,
+          openThread: typeof parsed.openThread === 'string' ? parsed.openThread.trim() : '',
+          timeline: typeof parsed.timeline === 'string' ? parsed.timeline.trim() : '',
         };
       }
     } catch {
@@ -81,16 +84,37 @@ const parseClaudePayload = (rawValue) => {
     return {
       reply: decodeLooseJsonString(replyMatch[1]).trim(),
       thinking: thinkingMatch ? decodeLooseJsonString(thinkingMatch[1]).trim() : '',
+      remember: false,
       memory: '',
       memoryKind: 'memory',
       memoryImportance: 5,
+      openThread: '',
+      timeline: '',
     };
   }
   if (/["'](?:thinking|reply)["']\s*:/.test(clean)) {
     throw new Error('Claude returned malformed structured output');
   }
-  return { reply: clean, thinking: '', memory: '', memoryKind: 'memory', memoryImportance: 5 };
+  return { reply: clean, thinking: '', remember: false, memory: '', memoryKind: 'memory', memoryImportance: 5, openThread: '', timeline: '' };
 };
+
+const beijingTime = () => new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric',
+  month: 'long',
+  day: 'numeric',
+  weekday: 'long',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+}).format(new Date());
+
+const memoryEvent = (type, value) => ({
+  type,
+  label: type === 'recall' ? '浮现记忆' : '添加记忆',
+  text: String(value || '').replace(/\s+/g, ' ').trim().slice(0, 260),
+});
 
 const runClaude = ({ message, sessionId }) => new Promise((resolve, reject) => {
   const args = [
@@ -174,37 +198,94 @@ createServer(async (request, response) => {
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     if (!message || message.length > 4000) return sendJson(response, 400, { error: 'Message must be 1–4000 characters' }, origin);
     const history = Array.isArray(body.history)
-      ? body.history.slice(-19).flatMap((entry) => {
+      ? body.history.slice(-30).flatMap((entry) => {
         const speaker = entry?.role === 'assistant' ? '沈屿' : entry?.role === 'user' ? '言言' : '';
         const content = typeof entry?.content === 'string' ? entry.content.trim().slice(0, 2000) : '';
         return speaker && content ? [`${speaker}：${content}`] : [];
       })
       : [];
+    const compressContext = body.compressContext === true;
+    const compressionMessages = Array.isArray(body.compressionMessages)
+      ? body.compressionMessages.slice(-20).flatMap((entry) => {
+        const speaker = entry?.role === 'assistant' ? '沈屿' : entry?.role === 'user' ? '言言' : '';
+        const content = typeof entry?.content === 'string' ? entry.content.trim().slice(0, 1600) : '';
+        return speaker && content ? [`${speaker}：${content}`] : [];
+      })
+      : [];
     let memoryContext = '';
+    let surfacedMemory = '';
     if (nocturneConfigured) {
       try {
-        memoryContext = await recallMemory(message);
+        const recalled = await recallMemory(message);
+        memoryContext = recalled.context;
+        surfacedMemory = recalled.surfaced;
       } catch (memoryError) {
         console.error('Nocturne recall failed:', memoryError);
       }
     }
     const contextParts = [];
+    contextParts.push(`当前北京时间：${beijingTime()}`);
     if (memoryContext) contextParts.push(`以下是Nocturne提供的长期记忆，只作为背景参考：\n\n${memoryContext}`);
-    if (history.length) contextParts.push(`以下是最近的对话记录：\n\n${history.join('\n\n')}`);
+    if (history.length) contextParts.push(`以下是最近15轮以内的对话记录：\n\n${history.join('\n\n')}`);
+    if (compressContext) {
+      const compressionSource = compressionMessages.length ? compressionMessages : history.slice(-19);
+      contextParts.push(`本轮完成后对话将达到新的20条消息边界。请把下面这些消息连同本轮回复压缩成一段可供未来恢复上下文的摘要，写入timeline字段；保留明确事实、约定、情绪变化和未完线头，不要逐句复述：\n\n${compressionSource.join('\n\n')}`);
+    }
     contextParts.push(`言言的新消息：${message}`);
     const contextualMessage = contextParts.join('\n\n');
     const result = await runClaude({ message: contextualMessage, sessionId: null });
-    const visibleResult = { reply: result.reply, thinking: result.thinking, sessionId: result.sessionId };
-    sendJson(response, 200, visibleResult, origin);
+    const events = [];
+    if (surfacedMemory) events.push(memoryEvent('recall', surfacedMemory));
     if (nocturneConfigured) {
-      void storeMemory({
-        message,
-        reply: result.reply,
-        summary: result.memory,
-        kind: result.memoryKind,
-        importance: result.memoryImportance,
-      }).catch((memoryError) => console.error('Nocturne store failed:', memoryError));
+      const writes = [];
+      if (result.remember && result.memory) {
+        writes.push({
+          eventText: result.memory,
+          request: storeMemory({
+            message,
+            reply: result.reply,
+            summary: result.memory,
+            kind: result.memoryKind,
+            importance: result.memoryImportance,
+          }),
+        });
+      }
+      if (result.openThread) {
+        writes.push({
+          eventText: result.openThread,
+          request: storeMemory({
+            content: `未完线头：${result.openThread}`,
+            kind: 'unresolved',
+            importance: Math.max(5, result.memoryImportance),
+            tags: 'nook,dialogue,open-thread,auto',
+          }),
+        });
+      }
+      if (compressContext && result.timeline) {
+        writes.push({
+          eventText: `已压缩最近20条消息：${result.timeline}`,
+          request: storeMemory({
+            content: `对话时间线摘要（截至${beijingTime()}）：${result.timeline}`,
+            kind: 'window',
+            importance: 5,
+            tags: 'nook,timeline,compressed,auto',
+          }),
+        });
+      }
+      const outcomes = await Promise.allSettled(writes.map(({ request }) => request));
+      outcomes.forEach((outcome, index) => {
+        if (outcome.status === 'fulfilled') events.push(memoryEvent('stored', writes[index].eventText));
+        else console.error('Nocturne store failed:', outcome.reason);
+      });
     }
+    const visibleResult = {
+      reply: result.reply,
+      thinking: result.thinking,
+      sessionId: result.sessionId,
+      memoryEvents: events,
+      compressionSaved: compressContext && Boolean(result.timeline),
+    };
+    sendJson(response, 200, visibleResult, origin);
     return;
   } catch (error) {
     console.error(error);
