@@ -43,8 +43,9 @@ test('recalls and stores memory through Streamable HTTP MCP', async (t) => {
   const { recallMemory, storeMemory } = await import(`../nocturne-client.mjs?test=${Date.now()}`);
 
   const recalled = await recallMemory('一个月');
-  assert.match(recalled, /核心记忆/);
-  assert.match(recalled, /相关记忆/);
+  assert.match(recalled.context, /核心记忆/);
+  assert.match(recalled.context, /相关记忆/);
+  assert.equal(recalled.surfaced, '相关记忆');
   await storeMemory({
     message: '我们在一起一个月了',
     reply: '我记得。',
@@ -55,4 +56,11 @@ test('recalls and stores memory through Streamable HTTP MCP', async (t) => {
   assert.deepEqual(calls.map((call) => call.name), ['breath', 'trace', 'hold']);
   assert.equal(calls.at(-1).arguments.importance, 8);
   assert.equal(calls.at(-1).arguments.kind, 'memory');
+});
+
+test('does not create a memory when the model chose nothing to keep', async () => {
+  process.env.NOCTURNE_MCP_URL = 'https://memory.example.test';
+  const { storeMemory } = await import(`../nocturne-client.mjs?empty=${Date.now()}`);
+  const result = await storeMemory({ message: '你好', reply: '你好呀', summary: '' });
+  assert.equal(result, '');
 });
