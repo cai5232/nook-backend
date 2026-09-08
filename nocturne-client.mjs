@@ -71,6 +71,19 @@ async function postMcp(payload, sessionId = '') {
   };
 }
 
+async function closeMcpSession(sessionId) {
+  if (!sessionId) return;
+  try {
+    await fetch(mcpUrl, {
+      method: 'DELETE',
+      headers: requestHeaders(sessionId),
+      signal: AbortSignal.timeout(Math.min(timeoutMs, 3_000)),
+    });
+  } catch {
+    // Session cleanup must never make chat or memory operations fail.
+  }
+}
+
 async function callTool(name, args = {}) {
   if (!mcpUrl) return '';
   const initialize = await postMcp({
@@ -84,20 +97,24 @@ async function callTool(name, args = {}) {
     },
   });
   if (initialize.payload?.error) throw new Error(initialize.payload.error.message || 'Nocturne MCP initialization failed');
-  await postMcp({ jsonrpc: '2.0', method: 'notifications/initialized' }, initialize.sessionId);
-  const called = await postMcp({
-    jsonrpc: '2.0',
-    id: 2,
-    method: 'tools/call',
-    params: { name, arguments: args },
-  }, initialize.sessionId);
-  if (called.payload?.error) throw new Error(called.payload.error.message || `Nocturne tool ${name} failed`);
-  if (called.payload?.result?.isError) throw new Error(`Nocturne tool ${name} returned an error`);
-  return (called.payload?.result?.content || [])
-    .filter((item) => item?.type === 'text' && typeof item.text === 'string')
-    .map((item) => item.text)
-    .join('\n')
-    .trim();
+  try {
+    await postMcp({ jsonrpc: '2.0', method: 'notifications/initialized' }, initialize.sessionId);
+    const called = await postMcp({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name, arguments: args },
+    }, initialize.sessionId);
+    if (called.payload?.error) throw new Error(called.payload.error.message || `Nocturne tool ${name} failed`);
+    if (called.payload?.result?.isError) throw new Error(`Nocturne tool ${name} returned an error`);
+    return (called.payload?.result?.content || [])
+      .filter((item) => item?.type === 'text' && typeof item.text === 'string')
+      .map((item) => item.text)
+      .join('\n')
+      .trim();
+  } finally {
+    await closeMcpSession(initialize.sessionId);
+  }
 }
 
 async function coreMemory() {
