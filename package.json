@@ -8,7 +8,8 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "build": "node --check server.mjs"
+    "build": "node --check server.mjs && node --check nocturne-client.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "@anthropic-ai/claude-code": "2.1.263"
