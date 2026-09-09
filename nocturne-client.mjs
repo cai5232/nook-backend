@@ -5,7 +5,9 @@ const rawUrl = String(process.env.NOCTURNE_API_URL || '').trim();
 const token = String(process.env.NOCTURNE_API_TOKEN || '').trim();
 const timeoutMs = positiveInt(process.env.NOCTURNE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
 const contextChars = positiveInt(process.env.NOCTURNE_CONTEXT_CHARS, DEFAULT_CONTEXT_CHARS);
-const recallLimit = positiveInt(process.env.NOCTURNE_RECALL_LIMIT, 8);
+// Keep the prompt focused: the memory service already ranks matches, and Nook
+// only needs a few of the strongest ones for a natural reply.
+const recallLimit = positiveInt(process.env.NOCTURNE_RECALL_LIMIT, 4);
 
 function positiveInt(value, fallback) {
   const parsed = Number.parseInt(value, 10);
@@ -77,7 +79,9 @@ function normalizeRecall(payload) {
   if (!sections.length && suppliedContext) sections.push(suppliedContext);
   return {
     context: sections.join('\n\n').slice(0, contextChars),
-    surfaced: compactEventText(payload?.surfaced || related || core),
+    // A visible "memory surfaced" event is opt-in on the server. Falling
+    // back to every related/core item made the UI imply a recall on every turn.
+    surfaced: compactEventText(payload?.surfaced),
   };
 }
 
