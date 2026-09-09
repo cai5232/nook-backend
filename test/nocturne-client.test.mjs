@@ -48,3 +48,18 @@ test('does not create a memory when the model chose nothing to keep', async () =
   const result = await storeMemory({ message: '你好', reply: '你好呀', summary: '' });
   assert.equal(result, '');
 });
+
+
+test('does not surface a memory bubble when recall only supplied prompt context', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => Response.json({ related: '仅供模型参考的相关记忆' });
+
+  process.env.NOCTURNE_API_URL = 'https://memory.example.test';
+  process.env.NOCTURNE_API_TOKEN = 'secret';
+  const { recallMemory } = await import(`../nocturne-client.mjs?no-surface=${Date.now()}`);
+  const recalled = await recallMemory('普通聊天');
+
+  assert.match(recalled.context, /仅供模型参考/);
+  assert.equal(recalled.surfaced, '');
+});
