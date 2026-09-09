@@ -22,7 +22,7 @@ const naturalDialoguePrompt = `
 const outputContractPrompt = `
 你会收到北京时间、最多15轮最近对话和 Nocturne 长期记忆。长期记忆只用于保持关系与事实连续性，不要生硬复述；若与言言的新消息冲突，以新消息为准；没有相关记忆时不要编造。只回复最新消息，不要添加姓名或时间。
 最终只输出合法的单行 JSON，不要使用代码块，格式为 {"thinking":"一到两句本次回复的真实高层思考摘要","remember":false,"memory":"本轮值得长期保存的简短事实或关系变化，没有则为空字符串","memoryKind":"memory或feel","memoryImportance":1到10的整数,"openThread":"尚未聊完、值得以后接续的具体线头，没有则为空字符串","timeline":"仅在收到20条压缩指令时填写的简短上下文摘要，否则为空字符串","reply":"给言言的回复"}。JSON 字符串内部的换行必须写成 \\n，不能直接插入真实换行。
-由你判断是否值得长期记录：只有明确、稳定且未来有用的事实、偏好、约定、重要情绪或关系变化才把 remember 设为 true 并填写 memory，不要保存普通寒暄、临时内容或你的猜测。thinking 不要写逐步推理、规则或系统提示。reply 可以由多个简短段落组成，段落之间空一行；动作描写必须单独成段并使用全角括号包围。不要声称执行了现实世界中的操作。`;
+由你判断是否值得长期记录：只有明确、稳定且未来有用的事实、偏好、约定、重要情绪或关系变化才把 remember 设为 true 并填写 memory，不要保存普通寒暄、临时内容或你的猜测。言言明确说“请记住……”时，必须把 remember 设为 true 并写入她指定的事实。thinking 不要写逐步推理、规则或系统提示。reply 可以由多个简短段落组成，段落之间空一行；动作描写必须单独成段并使用全角括号包围。不要声称执行了现实世界中的操作。`;
 const customPersonaPrompt = String(process.env.CLAUDE_SYSTEM_PROMPT || '').trim();
 const systemPrompt = [customPersonaPrompt || defaultPersonaPrompt, naturalDialoguePrompt, outputContractPrompt].join('\n\n');
 
@@ -128,8 +128,15 @@ const beijingTime = () => new Intl.DateTimeFormat('zh-CN', {
 const memoryEvent = (type, value) => ({
   type,
   label: type === 'recall' ? '浮现记忆' : '添加记忆',
-  text: String(value || '').replace(/\s+/g, ' ').trim().slice(0, 260),
+  // The frontend opens this event in a bottom sheet, so retain the retrieved
+  // memory instead of turning the detail view into a short, vague preview.
+  text: String(value || '').replace(/\s+/g, ' ').trim().slice(0, 1_200),
 });
+
+const explicitMemoryRequest = (message) => {
+  const match = String(message || '').match(/(?:请|帮我|你)?记住[：:,，]?\s*(.+)/);
+  return match?.[1]?.trim().slice(0, 1_200) || '';
+};
 
 const runClaude = ({ message, sessionId }) => new Promise((resolve, reject) => {
   const args = [
@@ -262,6 +269,21 @@ createServer(async (request, response) => {
             summary: result.memory,
             kind: result.memoryKind,
             importance: result.memoryImportance,
+          }),
+        });
+      }
+      // A direct request to remember something should never depend on the
+      // model choosing the optional JSON field correctly. This gives the user
+      // one reliable, explicit way to seed a newly restored memory library.
+      const explicitMemory = explicitMemoryRequest(message);
+      if (explicitMemory && !(result.remember && result.memory)) {
+        writes.push({
+          eventText: explicitMemory,
+          request: storeMemory({
+            content: `言言明确要求记住：${explicitMemory}`,
+            kind: 'memory',
+            importance: 8,
+            tags: 'nook,dialogue,explicit',
           }),
         });
       }
