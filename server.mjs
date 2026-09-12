@@ -267,7 +267,7 @@ const server = createServer(async (request, response) => {
     const assistantMessage = { id: crypto.randomUUID(), role: 'assistant', text: result.reply, thinking: result.thinking, imageDescriptions: result.imageDescriptions, metrics: result.metrics, createdAt: Date.now() };
     conversation.messages.push(assistantMessage);
     await saveConversation(conversation);
-    return sendJson(response, 200, { userMessage, assistantMessage, memoryCards: conversation.memoryCards }, origin);
+    return sendJson(response, 200, { userMessage, assistantMessage, memoryCards: conversation.memoryCards, surfacedMemory }, origin);
   } catch (error) {
     console.error(error);
     const code = error.message;
