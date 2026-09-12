@@ -17,7 +17,10 @@ const bridgeToken = String(process.env.NOOK_BRIDGE_TOKEN || '').trim();
 const requestBuckets = new Map();
 const runtime = { startedAt: Date.now(), lastRequestAt: null, activeRequests: 0 };
 const maxImageBytes = Number(process.env.NOOK_MAX_IMAGE_BYTES) || 10 * 1024 * 1024;
-const gatewayBuild = 'image-gateway-2026-09-12';
+const gatewayBuild = 'vision-gateway-2026-09-12';
+const visionApiKey = String(process.env.OPENAI_API_KEY || '').trim();
+const visionModel = String(process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini').trim();
+const visionBaseUrl = String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\\/+$/, '');
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
 const defaultPersonaPrompt = '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非言言使用其他语言。';
@@ -120,16 +123,20 @@ const parseClaudePayload = (rawValue, attachments) => {
 };
 
 const beijingTime = () => new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: 'long', day: 'numeric', weekday: 'long', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date());
-const makeContext = ({ conversation, message, attachments, memoryContext }) => {
+const makeContext = ({ conversation, message, attachments, imageDescriptions, memoryContext }) => {
   const dialogue = conversation.messages.slice(0, -1).slice(-30).flatMap((entry) => {
     const speaker = entry.role === 'assistant' ? '沈屿' : entry.role === 'user' ? '言言' : '';
     const text = typeof entry.text === 'string' ? entry.text.trim().slice(0, 2000) : '';
-    return speaker && text ? [`${speaker}：${text}`] : [];
+    const images = Object.values(entry.imageDescriptions || {}).filter((value) => typeof value === 'string' && value.trim()).map((value) => value.trim().slice(0, 1600));
+    if (!speaker) return [];
+    const lines = text ? [`${speaker}：${text}`] : [];
+    if (images.length) lines.push(`${speaker}发送的图片识别结果：${images.join('；')}`);
+    return lines;
   });
   const parts = [`当前北京时间：${beijingTime()}`];
   if (memoryContext) parts.push(`以下是已有长期记忆，只作为背景参考；不要写入、更新或添加它：\n\n${memoryContext}`);
   if (dialogue.length) parts.push(`以下是网关持久化的最近对话：\n\n${dialogue.join('\n\n')}`);
-  if (attachments.length) parts.push(`本轮图片附件已保存在本机。请直接查看每个路径，并在 imageDescriptions 里逐一描述可见内容：\n${attachments.map((item) => `- id=${item.id}; 名称=${item.name}; 路径=${item.path}`).join('\n')}`);
+  if (attachments.length) parts.push(`本轮附带图片已由独立视觉服务识别。只以以下识别结果理解图片，不要声称直接读取了本地文件：\n${attachments.map((item) => `- id=${item.id}；名称=${item.name}；识别结果=${imageDescriptions[item.id] || '未返回识别结果'}`).join('\n')}`);
   parts.push(`言言的新消息：${message || '（本轮仅发送了图片，请根据图片自然回应。）'}`);
   return parts.join('\n\n');
 };
@@ -143,10 +150,63 @@ const metricFromResult = (result) => {
   return { tokens: input + output + cacheRead + cacheCreated, cacheRate: base ? cacheRead / base : null, inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheCreatedTokens: cacheCreated };
 };
 
+const visionPrompt = '请客观、简洁地描述这张图片中可见的主体、文字、场景、关系和重要细节。不要猜测不可见信息；使用中文，控制在 500 字以内。';
+
+const describeAttachmentWithOpenAI = async (attachment) => {
+  const cached = attachment?.vision?.description;
+  if (typeof cached === 'string' && cached.trim()) return cached.trim();
+  if (!visionApiKey) throw new Error('VISION_NOT_CONFIGURED');
+  const image = await readFile(attachment.path);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const response = await fetch(`${visionBaseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${visionApiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: visionModel,
+        temperature: 0.2,
+        max_tokens: 700,
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: visionPrompt },
+          { type: 'image_url', image_url: { url: `data:${attachment.mimeType};base64,${image.toString('base64')}`, detail: 'high' } },
+        ] }],
+      }),
+      signal: controller.signal,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      console.error('Vision API response:', response.status, result?.error?.message || result);
+      throw new Error('VISION_REQUEST_FAILED');
+    }
+    const content = result?.choices?.[0]?.message?.content;
+    const description = typeof content === 'string' ? content.trim() : '';
+    if (!description) throw new Error('VISION_EMPTY_RESPONSE');
+    return description.slice(0, 1600);
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('VISION_REQUEST_TIMED_OUT');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const describeAttachments = async (attachments) => {
+  if (!attachments.length) return {};
+  const index = await loadUploadIndex();
+  const descriptions = {};
+  for (const attachment of attachments) {
+    const description = await describeAttachmentWithOpenAI(attachment);
+    descriptions[attachment.id] = description;
+    const stored = index[attachment.id];
+    if (stored) index[attachment.id] = { ...stored, vision: { description, model: visionModel, createdAt: Date.now() } };
+  }
+  await saveUploadIndex(index);
+  return descriptions;
+};
+
 const runClaude = ({ message, sessionId, attachments }) => new Promise((resolveRun, rejectRun) => {
-  const args = ['-p', '--output-format', 'json', '--max-turns', '1', '--permission-mode', 'dontAsk', '--system-prompt', systemPrompt, '--add-dir', uploadsDir];
-  if (attachments.length) args.push('--allowedTools', 'Read');
-  else args.push('--tools', '');
+  const args = ['-p', '--output-format', 'json', '--max-turns', '1', '--permission-mode', 'dontAsk', '--system-prompt', systemPrompt, '--tools', ''];
   if (process.env.CLAUDE_MODEL) args.push('--model', process.env.CLAUDE_MODEL);
   if (sessionId) args.push('--resume', sessionId);
   args.push(message);
@@ -220,7 +280,7 @@ const server = createServer(async (request, response) => {
   }
   if (origin && !allowedOrigins.has(origin)) return sendJson(response, 403, { error: 'Origin not allowed' });
   if (!authorize(request)) return sendJson(response, 401, { error: 'Unauthorized' }, origin);
-  if (request.method === 'GET' && url.pathname === '/health') return sendJson(response, 200, { ok: true, gateway: { build: gatewayBuild, warm: true, uptimeMs: Date.now() - runtime.startedAt, activeRequests: runtime.activeRequests, lastRequestAt: runtime.lastRequestAt }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
+  if (request.method === 'GET' && url.pathname === '/health') return sendJson(response, 200, { ok: true, gateway: { build: gatewayBuild, warm: true, uptimeMs: Date.now() - runtime.startedAt, activeRequests: runtime.activeRequests, lastRequestAt: runtime.lastRequestAt }, vision: { configured: Boolean(visionApiKey), model: visionModel }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
   if (isRateLimited(request)) return sendJson(response, 429, { error: 'Too many requests' }, origin);
 
   const conversationMatch = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9_-]{8,128})$/);
@@ -244,6 +304,15 @@ const server = createServer(async (request, response) => {
       const attachment = await writeUpload(await readJson(request, Math.ceil(maxImageBytes * 1.4) + 128 * 1024));
       return sendJson(response, 201, { attachment: publicAttachment(attachment) }, origin);
     }
+    if (url.pathname === '/api/vision') {
+      const body = await readJson(request);
+      const conversationId = body?.conversationId;
+      if (!validId(conversationId)) return sendJson(response, 400, { error: 'Invalid conversation' }, origin);
+      const attachments = await attachedFilesForConversation(conversationId, body?.attachments);
+      if (!attachments.length) return sendJson(response, 400, { error: 'Image required' }, origin);
+      const imageDescriptions = await describeAttachments(attachments);
+      return sendJson(response, 200, { imageDescriptions, model: visionModel }, origin);
+    }
     if (url.pathname !== '/api/chat') return sendJson(response, 404, { error: 'Not found' }, origin);
     const body = await readJson(request);
     const conversationId = body?.conversationId;
@@ -253,7 +322,8 @@ const server = createServer(async (request, response) => {
     const attachments = await attachedFilesForConversation(conversationId, body?.attachments);
     if (!message && !attachments.length) return sendJson(response, 400, { error: 'Message or image required' }, origin);
     const conversation = await loadConversation(conversationId);
-    const userMessage = { id: crypto.randomUUID(), role: 'user', text: message, attachments: attachments.map(publicAttachment), createdAt: Date.now() };
+    const imageDescriptions = await describeAttachments(attachments);
+    const userMessage = { id: crypto.randomUUID(), role: 'user', text: message, attachments: attachments.map(publicAttachment), imageDescriptions, createdAt: Date.now() };
     conversation.messages.push(userMessage);
     let memoryContext = ''; let surfacedMemory = '';
     if (nocturneConfigured) {
@@ -263,17 +333,18 @@ const server = createServer(async (request, response) => {
       } catch (error) { console.error('Nocturne recall failed:', error); }
     }
     if (surfacedMemory) conversation.memoryCards.push({ id: crypto.randomUUID(), text: surfacedMemory.slice(0, 1200), createdAt: Date.now() });
-    const result = await runWithPersistentSession({ message: makeContext({ conversation, message, attachments, memoryContext }), sessionId: conversation.sessionId, attachments });
+    const result = await runWithPersistentSession({ message: makeContext({ conversation, message, attachments, imageDescriptions, memoryContext }), sessionId: conversation.sessionId, attachments });
     conversation.sessionId = result.sessionId || conversation.sessionId;
-    const assistantMessage = { id: crypto.randomUUID(), role: 'assistant', text: result.reply, thinking: result.thinking, imageDescriptions: result.imageDescriptions, metrics: result.metrics, createdAt: Date.now() };
+    const assistantMessage = { id: crypto.randomUUID(), role: 'assistant', text: result.reply, thinking: result.thinking, imageDescriptions, metrics: result.metrics, createdAt: Date.now() };
     conversation.messages.push(assistantMessage);
     await saveConversation(conversation);
     return sendJson(response, 200, { userMessage, assistantMessage, memoryCards: conversation.memoryCards, surfacedMemory }, origin);
   } catch (error) {
     console.error(error);
     const code = error.message;
-    const status = code === 'PAYLOAD_TOO_LARGE' || code === 'IMAGE_TOO_LARGE' ? 413 : code === 'INVALID_IMAGE' || code === 'INVALID_CONVERSATION' ? 400 : 502;
-    return sendJson(response, status, { error: status === 413 ? '图片过大' : status === 400 ? '图片格式或会话无效' : 'Claude is temporarily unavailable' }, origin);
+    const status = code === 'PAYLOAD_TOO_LARGE' || code === 'IMAGE_TOO_LARGE' ? 413 : code === 'INVALID_IMAGE' || code === 'INVALID_CONVERSATION' ? 400 : code === 'VISION_NOT_CONFIGURED' ? 503 : 502;
+    const errorMessage = status === 413 ? '图片过大' : status === 400 ? '图片格式或会话无效' : code === 'VISION_NOT_CONFIGURED' ? '图片识别服务尚未配置 OPENAI_API_KEY' : code.startsWith('VISION_') ? '图片识别服务暂时不可用' : 'Claude is temporarily unavailable';
+    return sendJson(response, status, { error: errorMessage }, origin);
   } finally { runtime.activeRequests = Math.max(0, runtime.activeRequests - 1); }
 });
 
