@@ -17,6 +17,7 @@ const bridgeToken = String(process.env.NOOK_BRIDGE_TOKEN || '').trim();
 const requestBuckets = new Map();
 const runtime = { startedAt: Date.now(), lastRequestAt: null, activeRequests: 0 };
 const maxImageBytes = Number(process.env.NOOK_MAX_IMAGE_BYTES) || 10 * 1024 * 1024;
+const gatewayBuild = 'image-gateway-2026-09-12';
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
 const defaultPersonaPrompt = '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非言言使用其他语言。';
@@ -219,7 +220,7 @@ const server = createServer(async (request, response) => {
   }
   if (origin && !allowedOrigins.has(origin)) return sendJson(response, 403, { error: 'Origin not allowed' });
   if (!authorize(request)) return sendJson(response, 401, { error: 'Unauthorized' }, origin);
-  if (request.method === 'GET' && url.pathname === '/health') return sendJson(response, 200, { ok: true, gateway: { warm: true, uptimeMs: Date.now() - runtime.startedAt, activeRequests: runtime.activeRequests, lastRequestAt: runtime.lastRequestAt }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
+  if (request.method === 'GET' && url.pathname === '/health') return sendJson(response, 200, { ok: true, gateway: { build: gatewayBuild, warm: true, uptimeMs: Date.now() - runtime.startedAt, activeRequests: runtime.activeRequests, lastRequestAt: runtime.lastRequestAt }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
   if (isRateLimited(request)) return sendJson(response, 429, { error: 'Too many requests' }, origin);
 
   const conversationMatch = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9_-]{8,128})$/);
