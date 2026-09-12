@@ -17,7 +17,7 @@ const bridgeToken = String(process.env.NOOK_BRIDGE_TOKEN || '').trim();
 const requestBuckets = new Map();
 const runtime = { startedAt: Date.now(), lastRequestAt: null, activeRequests: 0 };
 const maxImageBytes = Number(process.env.NOOK_MAX_IMAGE_BYTES) || 10 * 1024 * 1024;
-const gatewayBuild = 'vision-gateway-2026-09-12';
+const gatewayBuild = 'vision-gateway-2026-09-12-r2';
 const visionApiKey = String(process.env.OPENAI_API_KEY || '').trim();
 const visionModel = String(process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini').trim();
 const visionBaseUrl = String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
@@ -280,7 +280,7 @@ const server = createServer(async (request, response) => {
   }
   if (origin && !allowedOrigins.has(origin)) return sendJson(response, 403, { error: 'Origin not allowed' });
   if (!authorize(request)) return sendJson(response, 401, { error: 'Unauthorized' }, origin);
-  if (request.method === 'GET' && url.pathname === '/health') return sendJson(response, 200, { ok: true, gateway: { build: gatewayBuild, warm: true, uptimeMs: Date.now() - runtime.startedAt, activeRequests: runtime.activeRequests, lastRequestAt: runtime.lastRequestAt }, vision: { configured: Boolean(visionApiKey), model: visionModel }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
+  if (request.method === 'GET' && url.pathname === '/health') return sendJson(response, 200, { ok: true, gateway: { build: gatewayBuild, warm: true, uptimeMs: Date.now() - runtime.startedAt, activeRequests: runtime.activeRequests, lastRequestAt: runtime.lastRequestAt }, vision: { configured: Boolean(visionApiKey), model: visionModel, uploadRoute: '/api/uploads', visionRoute: '/api/vision' }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
   if (isRateLimited(request)) return sendJson(response, 429, { error: 'Too many requests' }, origin);
 
   const conversationMatch = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9_-]{8,128})$/);
