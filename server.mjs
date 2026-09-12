@@ -17,7 +17,7 @@ const bridgeToken = String(process.env.NOOK_BRIDGE_TOKEN || '').trim();
 const requestBuckets = new Map();
 const runtime = { startedAt: Date.now(), lastRequestAt: null, activeRequests: 0 };
 const maxImageBytes = Number(process.env.NOOK_MAX_IMAGE_BYTES) || 10 * 1024 * 1024;
-const gatewayBuild = 'vision-gateway-2026-09-12-r2';
+const gatewayBuild = 'vision-gateway-2026-09-12-r3';
 const visionApiKey = String(process.env.OPENAI_API_KEY || '').trim();
 const visionModel = String(process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini').trim();
 const visionBaseUrl = String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
@@ -288,7 +288,7 @@ const server = createServer(async (request, response) => {
     const conversation = await loadConversation(conversationMatch[1]);
     return sendJson(response, 200, { conversationId: conversation.id, messages: conversation.messages, memoryCards: conversation.memoryCards, updatedAt: conversation.updatedAt }, origin);
   }
-  const uploadMatch = url.pathname.match(/^\/api\/uploads\/([a-f0-9-]{36})$/i);
+  const uploadMatch = url.pathname.match(/^\/api\/(?:uploads|upload|images)\/([a-f0-9-]{36})$/i);
   if (request.method === 'GET' && uploadMatch) {
     const index = await loadUploadIndex();
     const attachment = index[uploadMatch[1]];
@@ -300,7 +300,7 @@ const server = createServer(async (request, response) => {
 
   try {
     runtime.activeRequests += 1; runtime.lastRequestAt = Date.now();
-    if (url.pathname === '/api/uploads') {
+    if (url.pathname === '/api/uploads' || url.pathname === '/api/upload' || url.pathname === '/api/images') {
       const attachment = await writeUpload(await readJson(request, Math.ceil(maxImageBytes * 1.4) + 128 * 1024));
       return sendJson(response, 201, { attachment: publicAttachment(attachment) }, origin);
     }
