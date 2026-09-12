@@ -20,7 +20,7 @@ const maxImageBytes = Number(process.env.NOOK_MAX_IMAGE_BYTES) || 10 * 1024 * 10
 const gatewayBuild = 'vision-gateway-2026-09-12';
 const visionApiKey = String(process.env.OPENAI_API_KEY || '').trim();
 const visionModel = String(process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini').trim();
-const visionBaseUrl = String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\\/+$/, '');
+const visionBaseUrl = String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
 const defaultPersonaPrompt = '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非言言使用其他语言。';
