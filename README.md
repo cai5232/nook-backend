@@ -12,6 +12,8 @@ Small HTTP bridge between the nook frontend and Claude Code print mode. It can c
   session ids, uploaded images, recognition results, and surfaced-memory cards.
   Defaults to `$CLAUDE_WORKDIR/gateway`; mount this directory in production so
   redeploying or restarting the service does not discard a conversation.
+- `OPENAI_API_KEY`: required for image recognition. It is used only by the
+  backend; never put it in the frontend.
 
 Optional settings:
 
@@ -20,6 +22,8 @@ Optional settings:
 - `CLAUDE_BIN`: existing Claude executable path on the VPS, for example the output of `command -v claude`.
 - `CLAUDE_WORKDIR`: writable session directory; defaults to `/tmp/nook-claude`.
 - `NOOK_MAX_IMAGE_BYTES`: maximum accepted image size; defaults to 10MB.
+- `OPENAI_VISION_MODEL`: vision model used before Claude; defaults to `gpt-4o-mini`.
+- `OPENAI_BASE_URL`: optional OpenAI-compatible API base URL; defaults to `https://api.openai.com/v1`.
 - `NOCTURNE_API_URL`: Nocturne service root URL. Nook calls its direct server API every turn; it does not use MCP.
 - `NOCTURNE_API_TOKEN`: dedicated Bearer token shared only between the nook backend and Nocturne.
 - `NOCTURNE_TIMEOUT_MS`: direct API request timeout; defaults to `8000`.
@@ -33,15 +37,16 @@ Optional settings:
 - `POST /api/uploads` with a base64 image data URL; returns a durable attachment
   URL.
 - `GET /api/uploads/:attachmentId`
+- `POST /api/vision` with `conversationId` and attachment ids; returns cached
+  or newly generated OpenAI image descriptions.
 - `POST /api/chat` with `conversationId`, `message`, and optional attachment
-  ids.
+  ids. When attachments are present, it calls the same vision flow first.
 
-The gateway is the source of truth for conversation context. It writes the user
-message before generation, reads its own recent context on every request, then
-writes the assistant reply, token/cache metrics, image recognition descriptions,
-and the reusable Claude session id. Images are stored beneath the persistent
-gateway directory and Claude Code receives their local paths with
-`--add-dir`; no separate visual API is used. The backend never asks the model
+The gateway is the source of truth for conversation context. For an image message,
+it saves the original image, calls the OpenAI-compatible vision API first, caches
+the description against that image, writes the description into the durable user
+message, and only then starts Claude. Claude receives the text description in
+its conversation context rather than a local file path. The backend never asks the model
 to autonomously add or update long-term memory. Existing Nocturne recall remains
 read-only and is saved as a separate surfaced-memory card for the cloud UI.
 
