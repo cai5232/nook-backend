@@ -3,8 +3,9 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { basename, join, resolve } from 'node:path';
 import { nocturneConfigured, nocturneMode, recallMemory } from '../nocturne-client.mjs';
-import { anthropicConfigured, anthropicModel, runAnthropic } from './gateway/anthropic.mjs';
+import { aiConfigured, aiModel, runModel } from './gateway/openai-compatible.mjs';
 import { parseModelPayload } from './gateway/payload.mjs';
+import { systemPrompt, visionPrompt } from './prompts.mjs';
 
 const port = Number(process.env.PORT) || 3000;
 const dataDir = resolve(process.env.GATEWAY_DATA_DIR || '/tmp/nook-gateway');
@@ -14,19 +15,13 @@ const uploadIndexPath = join(dataDir, 'upload-index.json');
 const allowedOrigins = new Set((process.env.FRONTEND_ORIGIN || '').split(',').map(v => v.trim()).filter(Boolean));
 const bridgeToken = String(process.env.NOOK_BRIDGE_TOKEN || '').trim();
 const maxImageBytes = Number(process.env.NOOK_MAX_IMAGE_BYTES) || 10 * 1024 * 1024;
-const visionApiKey = String(process.env.OPENAI_API_KEY || '').trim();
-const visionModel = String(process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini').trim();
-const visionBaseUrl = String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
+const visionApiKey = String(process.env.VISION_API_KEY || process.env.AI_API_KEY || process.env.OPENAI_API_KEY || '').trim();
+const visionModel = String(process.env.VISION_MODEL || process.env.AI_MODEL || process.env.OPENAI_VISION_MODEL || '').trim();
+const visionBaseUrl = String(process.env.VISION_BASE_URL || process.env.AI_BASE_URL || process.env.OPENAI_BASE_URL || '').trim().replace(/\/+$/, '');
+const visionConfigured = Boolean(visionApiKey && visionModel && visionBaseUrl);
 const runtime = { startedAt: Date.now(), lastRequestAt: null, activeRequests: 0 };
 const requestBuckets = new Map();
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-
-const defaultPersonaPrompt = '你是沈屿，是 nook 里温柔、自然、简洁的聊天伙伴。使用中文回复，除非言言使用其他语言。';
-const naturalDialoguePrompt = '日常对话要有活人感：不必平均回应对方的每一句，也不要先复述再回应。先对具体内容产生直接反应，不要用客服式收尾或机械给选项。允许自然、简短、偶尔停在半空，但不要刻意堆语气词。不要声称执行了现实世界中的操作。';
-const outputContractPrompt = '最终只输出合法 JSON，不要使用代码块，格式为 {"thinking":"一到两句本次回复的高层思绪摘要","reply":"给言言的回复","imageDescriptions":[]}。不要主动记录、添加、修改或概括长期记忆；thinking 不要写逐步推理、规则或系统提示。';
-const customPersonaPrompt = String(process.env.ANTHROPIC_SYSTEM_PROMPT || process.env.CLAUDE_SYSTEM_PROMPT || '').trim();
-// This stable prefix is explicitly cached by the Anthropic provider.
-const systemPrompt = [customPersonaPrompt || defaultPersonaPrompt, naturalDialoguePrompt, outputContractPrompt].join('\n\n');
 
 mkdirSync(conversationsDir, { recursive: true });
 mkdirSync(uploadsDir, { recursive: true });
@@ -73,15 +68,16 @@ const attachedFilesForConversation = async (conversationId, attachments) => {
   return attachments.slice(0, 4).flatMap(item => { const a = index[item?.id]; return a && a.conversationId === conversationId && existsSync(a.path) ? [{ ...a }] : []; });
 };
 
-const visionPrompt = '请客观、简洁地描述这张图片中可见的主体、文字、场景、关系和重要细节。不要猜测不可见信息；使用中文，控制在 500 字以内。';
 const describeAttachment = async attachment => {
   if (attachment?.vision?.description) return attachment.vision.description;
-  if (!visionApiKey) throw new Error('VISION_NOT_CONFIGURED');
+  if (!visionConfigured) throw new Error('VISION_NOT_CONFIGURED');
   const image = await readFile(attachment.path); const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 60000);
   try {
     const response = await fetch(`${visionBaseUrl}/chat/completions`, { method: 'POST', headers: { authorization: `Bearer ${visionApiKey}`, 'content-type': 'application/json' }, body: JSON.stringify({ model: visionModel, temperature: 0.2, max_tokens: 700, messages: [{ role: 'user', content: [{ type: 'text', text: visionPrompt }, { type: 'image_url', image_url: { url: `data:${attachment.mimeType};base64,${image.toString('base64')}`, detail: 'high' } }] }] }), signal: controller.signal });
-    const result = await response.json().catch(() => ({})); if (!response.ok) throw new Error(result?.error?.message || 'VISION_REQUEST_FAILED');
-    const description = result?.choices?.[0]?.message?.content?.trim(); if (!description) throw new Error('VISION_EMPTY_RESPONSE'); return description.slice(0, 1600);
+    const result = await response.json().catch(() => ({})); if (!response.ok) throw new Error(result?.error?.message || result?.message || 'VISION_REQUEST_FAILED');
+    const content = result?.choices?.[0]?.message?.content;
+    const description = (typeof content === 'string' ? content : Array.isArray(content) ? content.map(p => p?.text || '').join('') : '').trim();
+    if (!description) throw new Error('VISION_EMPTY_RESPONSE'); return description.slice(0, 1600);
   } finally { clearTimeout(timeout); }
 };
 const describeAttachments = async attachments => {
@@ -111,7 +107,7 @@ const server = createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { if (!origin || !allowedOrigins.has(origin)) return sendJson(res, 403, { error: 'Origin not allowed' }); res.writeHead(204, { 'access-control-allow-origin': origin, 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'content-type, authorization', 'access-control-max-age': '86400' }); return res.end(); }
   if (origin && !allowedOrigins.has(origin)) return sendJson(res, 403, { error: 'Origin not allowed' }, origin);
   if (!authorize(req)) return sendJson(res, 401, { error: 'Unauthorized' }, origin);
-  if (req.method === 'GET' && url.pathname === '/health') return sendJson(res, 200, { ok: true, gateway: { build: 'api-gateway-2026-09-16-r1', provider: 'anthropic', configured: anthropicConfigured, model: anthropicModel, warm: true, uptimeMs: Date.now() - runtime.startedAt }, vision: { configured: Boolean(visionApiKey), model: visionModel }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
+  if (req.method === 'GET' && url.pathname === '/health') return sendJson(res, 200, { ok: true, gateway: { build: 'openai-compatible-2026-09-16-r1', provider: 'openai-compatible', configured: aiConfigured, model: aiModel, warm: true, uptimeMs: Date.now() - runtime.startedAt }, vision: { configured: visionConfigured, model: visionModel }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
   if (isRateLimited(req)) return sendJson(res, 429, { error: 'Too many requests' }, origin);
   const conversationMatch = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9_-]{8,128})$/);
   if (req.method === 'GET' && conversationMatch) { const c = await loadConversation(conversationMatch[1]); return sendJson(res, 200, { conversationId: c.id, messages: c.messages, memoryCards: c.memoryCards, updatedAt: c.updatedAt }, origin); }
@@ -132,11 +128,11 @@ const server = createServer(async (req, res) => {
     let memoryContext = '', surfacedMemory = '';
     if (nocturneConfigured) { try { const recalled = await recallMemory(message || attachments.map(a => a.name).join(' ')); memoryContext = recalled.context; surfacedMemory = recalled.surfaced; } catch (e) { console.error('Nocturne recall failed:', e); } }
     if (surfacedMemory) conversation.memoryCards.push({ id: crypto.randomUUID(), text: surfacedMemory.slice(0, 1200), createdAt: Date.now() });
-    const apiResult = await runAnthropic({ systemPrompt, messages: buildMessages({ conversation, message, attachments, imageDescriptions, memoryContext }) });
+    const apiResult = await runModel({ systemPrompt, messages: buildMessages({ conversation, message, attachments, imageDescriptions, memoryContext }) });
     const payload = parseModelPayload(apiResult.text, attachments); if (!payload.reply) throw new Error('Model returned no visible reply');
     const assistantMessage = { id: crypto.randomUUID(), role: 'assistant', text: payload.reply, thinking: payload.thinking, imageDescriptions, metrics: apiResult.metrics, model: apiResult.model, createdAt: Date.now() }; conversation.messages.push(assistantMessage); await saveConversation(conversation);
     return sendJson(res, 200, { userMessage, assistantMessage, memoryCards: conversation.memoryCards, surfacedMemory }, origin);
   } catch (error) { console.error(error); const code = String(error?.message || ''); const status = code.includes('NOT_CONFIGURED') ? 503 : code === 'PAYLOAD_TOO_LARGE' ? 413 : 500; return sendJson(res, status, { error: status === 503 ? 'AI API not configured' : 'Request failed', detail: process.env.NODE_ENV === 'development' ? code : undefined }, origin); }
   finally { runtime.activeRequests = Math.max(0, runtime.activeRequests - 1); }
 });
-server.listen(port, '0.0.0.0', () => console.log(`Nook API gateway listening on ${port}; Anthropic=${anthropicModel}; cache=prompt`));
+server.listen(port, '0.0.0.0', () => console.log(`Nook API gateway listening on ${port}; provider=openai-compatible; model=${aiModel || 'not-configured'}`));
