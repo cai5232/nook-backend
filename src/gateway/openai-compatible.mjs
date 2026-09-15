@@ -29,25 +29,31 @@ const cacheEnabled=()=>{const v=String(process.env.AI_PROMPT_CACHE||'').trim().t
 const cacheBlock=content=>{const blocks=Array.isArray(content)?content.map(p=>typeof p==='string'?{type:'text',text:p}:{...p}):[{type:'text',text:String(content??'')}];if(blocks.length)blocks[blocks.length-1]={...blocks[blocks.length-1],cache_control:{type:'ephemeral'}};return blocks;};
 const cachedSystemContent=p=>cacheEnabled()?cacheBlock(p):p;
 
-// BP4 follows the reference layout: one rolling breakpoint on the last stable
-// historical message. The current volatile user input stays after the boundary.
-const withRollingBP4=messages=>{
-  if(!cacheEnabled()||!Array.isArray(messages)||messages.length<2)return messages;
+// Keep the message cache boundary stable instead of moving it on every turn.
+// A moving breakpoint changes the cache prefix and can force providers/proxies
+// to create a fresh cache rather than reuse the previous one.
+const stableBreakpointIndex=messages=>{
+  if(!Array.isArray(messages)||messages.length<3)return null;
+  const stableCount=messages.length-1; // current user input is volatile
+  const configured=Math.max(2,Number(process.env.AI_CACHE_STABLE_MESSAGES)||8);
+  return stableCount>=configured?configured-1:null;
+};
+const withStableCacheBreakpoint=messages=>{
+  if(!cacheEnabled()||!Array.isArray(messages))return messages;
   const copy=messages.map(m=>({...m,content:Array.isArray(m.content)?m.content.map(p=>typeof p==='object'&&p?{...p}:p):m.content}));
-  const index=copy.length-2;
-  const target=copy[index];
-  if(target&&['user','assistant'].includes(target.role))target.content=cacheBlock(target.content);
+  const index=stableBreakpointIndex(copy);
+  if(index!=null){const target=copy[index];if(target&&['user','assistant'].includes(target.role))target.content=cacheBlock(target.content);}
   return copy;
 };
 
-const diagnostics=(systemPrompt,messages)=>{const stable=Array.isArray(messages)&&messages.length>1?messages.slice(0,-1):[],text=stable.map(m=>`${m.role}:${contentText(m.content)}`).join('\n');return{systemHash:hash(systemPrompt),systemChars:String(systemPrompt??'').length,historyHash:hash(text),historyChars:text.length,stableMessages:stable.length,bp4Index:stable.length?stable.length-1:null};};
+const diagnostics=(systemPrompt,messages)=>{const stable=Array.isArray(messages)&&messages.length>1?messages.slice(0,-1):[],text=stable.map(m=>`${m.role}:${contentText(m.content)}`).join('\n');return{systemHash:hash(systemPrompt),systemChars:String(systemPrompt??'').length,historyHash:hash(text),historyChars:text.length,stableMessages:stable.length,bp4Index:stableBreakpointIndex(messages)};};
 
 export const runModel=async({systemPrompt,messages})=>{
   if(!aiConfigured)throw new Error('AI_NOT_CONFIGURED');
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort(),Number(process.env.AI_TIMEOUT_MS)||120000);
   const diag=diagnostics(systemPrompt,messages);
-  const requestMessages=[{role:'system',content:cachedSystemContent(systemPrompt)},...withRollingBP4(messages)];
+  const requestMessages=[{role:'system',content:cachedSystemContent(systemPrompt)},...withStableCacheBreakpoint(messages)];
   console.log('[prompt-cache request]',JSON.stringify({model:aiModel,cacheEnabled:cacheEnabled(),...diag}));
   try{
     const response=await fetch(`${aiBaseUrl}/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${apiKey}`,'content-type':'application/json'},body:JSON.stringify({model:aiModel,messages:requestMessages,temperature:Number(process.env.AI_TEMPERATURE??.8),max_tokens:Number(process.env.AI_MAX_TOKENS)||1800}),signal:controller.signal});
@@ -55,8 +61,9 @@ export const runModel=async({systemPrompt,messages})=>{
     if(!response.ok)throw new Error(result?.error?.message||result?.message||`AI_REQUEST_FAILED_${response.status}`);
     const text=contentText(result?.choices?.[0]?.message?.content);
     if(!text)throw new Error('AI_EMPTY_RESPONSE');
-    const metrics=metricsFromUsage(result?.usage||{});
-    console.log('[prompt-cache usage]',JSON.stringify({prompt:metrics.uncachedInputTokens,cache_read:metrics.cacheReadTokens,cache_write:metrics.cacheCreatedTokens,cache_hit_rate:metrics.cacheRate==null?null:Number((metrics.cacheRate*100).toFixed(2)),...diag}));
+    const usage=result?.usage||{};
+    const metrics=metricsFromUsage(usage);
+    console.log('[prompt-cache usage]',JSON.stringify({prompt:metrics.uncachedInputTokens,cache_read:metrics.cacheReadTokens,cache_write:metrics.cacheCreatedTokens,cache_hit_rate:metrics.cacheRate==null?null:Number((metrics.cacheRate*100).toFixed(2)),raw_usage:usage,...diag}));
     return{text,model:result?.model||aiModel,metrics};
   }finally{clearTimeout(timeout);}
 };
