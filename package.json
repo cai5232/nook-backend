@@ -1,17 +1,14 @@
 {
   "name": "nook-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
-    "start": "node server.mjs",
-    "build": "node --check server.mjs && node --check nocturne-client.mjs",
+    "start": "node src/server.mjs",
+    "build": "node --check src/server.mjs && node --check src/gateway/anthropic.mjs && node --check src/gateway/payload.mjs && node --check nocturne-client.mjs",
     "test": "node --test"
-  },
-  "dependencies": {
-    "@anthropic-ai/claude-code": "2.1.263"
   }
 }
