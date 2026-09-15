@@ -7,16 +7,52 @@ const metricsFromUsage = (usage = {}) => {
   const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
   const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
   const openAiCachedTokens = usage?.prompt_tokens_details?.cached_tokens;
-  const cacheReadTokens = Number(openAiCachedTokens ?? usage.cache_read_input_tokens ?? usage.input_cache_read ?? usage.cache_read ?? usage.cacheReadInputTokens ?? 0) || 0;
+  const cacheReadTokens = Number(
+    openAiCachedTokens ??
+    usage.cache_read_input_tokens ??
+    usage.input_cache_read ??
+    usage.cache_read ??
+    usage.cacheReadInputTokens ??
+    0
+  ) || 0;
+
   const explicitCacheWrite = usage.cache_creation_input_tokens ?? usage.cache_creation_tokens ?? usage.input_cache_write ?? usage.cache_write ?? usage.cacheCreatedInputTokens;
-  const timedCacheWrite = (Number(usage.input_cache_write_5_min) || 0) + (Number(usage.input_cache_write_1_h) || 0);
+  const timedCacheWrite =
+    (Number(usage.input_cache_write_5_min) || 0) +
+    (Number(usage.input_cache_write_1_h) || 0);
   const cacheCreatedTokens = Number(explicitCacheWrite ?? timedCacheWrite) || 0;
-  const hasAnthropicCacheMetrics = usage.cache_read_input_tokens != null || usage.cache_creation_input_tokens != null || usage.cache_creation_tokens != null || usage.input_cache_read != null || usage.input_cache_write != null || usage.input_cache_write_5_min != null || usage.input_cache_write_1_h != null || usage.cache_read != null || usage.cache_write != null;
+
+  const hasAnthropicCacheMetrics =
+    usage.cache_read_input_tokens != null ||
+    usage.cache_creation_input_tokens != null ||
+    usage.cache_creation_tokens != null ||
+    usage.input_cache_read != null ||
+    usage.input_cache_write != null ||
+    usage.input_cache_write_5_min != null ||
+    usage.input_cache_write_1_h != null ||
+    usage.cache_read != null ||
+    usage.cache_write != null;
   const hasOpenAiCacheMetrics = openAiCachedTokens != null;
   const hasCacheMetrics = hasAnthropicCacheMetrics || hasOpenAiCacheMetrics;
-  const logicalInputTokens = hasAnthropicCacheMetrics ? inputTokens + cacheReadTokens + cacheCreatedTokens : inputTokens;
-  const rawRate = logicalInputTokens > 0 ? cacheReadTokens / logicalInputTokens : 0;
-  return { tokens: Number(usage.total_tokens) || logicalInputTokens + outputTokens, inputTokens: logicalInputTokens, outputTokens, cacheReadTokens, cacheCreatedTokens, cacheRate: hasCacheMetrics ? Math.min(1, Math.max(0, rawRate)) : null };
+
+  // ZenMux/Anthropic reports prompt/input as the uncached portion and cache reads/writes
+  // separately. The cache hit rate shown by ZenMux is cache_read divided by the complete
+  // logical input: prompt + cache_read + cache_write.
+  const logicalInputTokens = hasAnthropicCacheMetrics
+    ? inputTokens + cacheReadTokens + cacheCreatedTokens
+    : inputTokens;
+  const cacheRate = hasCacheMetrics && logicalInputTokens > 0
+    ? cacheReadTokens / logicalInputTokens
+    : null;
+
+  return {
+    tokens: Number(usage.total_tokens) || logicalInputTokens + outputTokens,
+    inputTokens: logicalInputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheCreatedTokens,
+    cacheRate
+  };
 };
 
 const contentText = content => {
@@ -32,21 +68,31 @@ const cacheEnabled = () => {
   return /(^|\/)claude(?:-|$)/i.test(aiModel) || /anthropic/i.test(aiModel);
 };
 
-const cachedSystemContent = systemPrompt => cacheEnabled() ? [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }] : systemPrompt;
-const asBlocks = content => Array.isArray(content) ? content.map(part => typeof part === 'string' ? { type: 'text', text: part } : { ...part }) : [{ type: 'text', text: String(content ?? '') }];
+const cachedSystemContent = systemPrompt => cacheEnabled()
+  ? [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }]
+  : systemPrompt;
 
-// Cache the stable conversation prefix, never the last (dynamic/current) user message.
-// The breakpoint rides forward on the previous assistant message, so a new turn can reuse
-// system + all prior history while the current-time/memory/image injection stays outside it.
+const asBlocks = content => Array.isArray(content)
+  ? content.map(part => typeof part === 'string' ? { type: 'text', text: part } : { ...part })
+  : [{ type: 'text', text: String(content ?? '') }];
+
 const withConversationBreakpoint = messages => {
   if (!cacheEnabled() || !Array.isArray(messages) || messages.length < 2) return messages;
-  const copy = messages.map(message => ({ ...message, content: Array.isArray(message.content) ? message.content.map(part => typeof part === 'object' && part ? { ...part } : part) : message.content }));
+  const copy = messages.map(message => ({
+    ...message,
+    content: Array.isArray(message.content)
+      ? message.content.map(part => typeof part === 'object' && part ? { ...part } : part)
+      : message.content
+  }));
   const targetIndex = copy.length - 2;
   const target = copy[targetIndex];
   if (!target || !['user', 'assistant'].includes(target.role)) return copy;
   const blocks = asBlocks(target.content);
   if (!blocks.length) return copy;
-  blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], cache_control: { type: 'ephemeral' } };
+  blocks[blocks.length - 1] = {
+    ...blocks[blocks.length - 1],
+    cache_control: { type: 'ephemeral' }
+  };
   target.content = blocks;
   return copy;
 };
@@ -59,7 +105,15 @@ export const runModel = async ({ systemPrompt, messages }) => {
     const response = await fetch(`${aiBaseUrl}/chat/completions`, {
       method: 'POST',
       headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: aiModel, messages: [{ role: 'system', content: cachedSystemContent(systemPrompt) }, ...withConversationBreakpoint(messages)], temperature: Number(process.env.AI_TEMPERATURE ?? 0.8), max_tokens: Number(process.env.AI_MAX_TOKENS) || 1800 }),
+      body: JSON.stringify({
+        model: aiModel,
+        messages: [
+          { role: 'system', content: cachedSystemContent(systemPrompt) },
+          ...withConversationBreakpoint(messages)
+        ],
+        temperature: Number(process.env.AI_TEMPERATURE ?? 0.8),
+        max_tokens: Number(process.env.AI_MAX_TOKENS) || 1800
+      }),
       signal: controller.signal
     });
     const result = await response.json().catch(() => ({}));
@@ -67,6 +121,12 @@ export const runModel = async ({ systemPrompt, messages }) => {
     const choice = result?.choices?.[0];
     const text = contentText(choice?.message?.content);
     if (!text) throw new Error('AI_EMPTY_RESPONSE');
-    return { text, model: result?.model || aiModel, metrics: metricsFromUsage(result?.usage || {}) };
-  } finally { clearTimeout(timeout); }
+    return {
+      text,
+      model: result?.model || aiModel,
+      metrics: metricsFromUsage(result?.usage || {})
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 };
