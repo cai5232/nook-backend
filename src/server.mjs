@@ -15,6 +15,7 @@ const uploadIndexPath = join(dataDir, 'upload-index.json');
 const allowedOrigins = new Set((process.env.FRONTEND_ORIGIN || '').split(',').map(v => v.trim()).filter(Boolean));
 const bridgeToken = String(process.env.NOOK_BRIDGE_TOKEN || '').trim();
 const maxImageBytes = Number(process.env.NOOK_MAX_IMAGE_BYTES) || 10 * 1024 * 1024;
+const sharedConversationId = String(process.env.NOOK_CONVERSATION_ID || 'nook-shenyu-main').trim();
 const visionApiKey = String(process.env.VISION_API_KEY || process.env.AI_API_KEY || process.env.OPENAI_API_KEY || '').trim();
 const visionModel = String(process.env.VISION_MODEL || process.env.AI_MODEL || process.env.OPENAI_VISION_MODEL || '').trim();
 const visionBaseUrl = String(process.env.VISION_BASE_URL || process.env.AI_BASE_URL || process.env.OPENAI_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -23,116 +24,24 @@ const runtime = { startedAt: Date.now(), lastRequestAt: null, activeRequests: 0 
 const requestBuckets = new Map();
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
-mkdirSync(conversationsDir, { recursive: true });
-mkdirSync(uploadsDir, { recursive: true });
-
-const sendJson = (res, status, value, origin) => {
-  const headers = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
-  if (origin && allowedOrigins.has(origin)) headers['access-control-allow-origin'] = origin;
-  res.writeHead(status, headers); res.end(JSON.stringify(value));
-};
-const readJson = async (req, limit = 128 * 1024) => {
-  const chunks = []; let size = 0;
-  for await (const chunk of req) { size += chunk.length; if (size > limit) throw new Error('PAYLOAD_TOO_LARGE'); chunks.push(chunk); }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-};
-const validId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{8,128}$/.test(value);
-const safeName = value => basename(String(value || 'image')).replace(/[^\w.\-() ]/g, '_').slice(0, 120) || 'image';
-const readJsonFile = async (path, fallback) => { try { return JSON.parse(await readFile(path, 'utf8')); } catch { return fallback; } };
-const writeJsonAtomic = async (path, value) => { const tmp = `${path}.${process.pid}.${Date.now()}.tmp`; await writeFile(tmp, JSON.stringify(value), 'utf8'); await rename(tmp, path); };
-const conversationPath = id => join(conversationsDir, `${id}.json`);
-const newConversation = id => ({ id, messages: [], memoryCards: [], createdAt: Date.now(), updatedAt: Date.now() });
-const loadConversation = async id => { const value = await readJsonFile(conversationPath(id), newConversation(id)); return value?.id === id ? value : newConversation(id); };
-const saveConversation = async c => { c.messages = Array.isArray(c.messages) ? c.messages.slice(-400) : []; c.memoryCards = Array.isArray(c.memoryCards) ? c.memoryCards.slice(-80) : []; c.updatedAt = Date.now(); await writeJsonAtomic(conversationPath(c.id), c); };
-const loadUploadIndex = () => readJsonFile(uploadIndexPath, {});
-const saveUploadIndex = index => writeJsonAtomic(uploadIndexPath, index);
-const publicAttachment = ({ path, ...rest }) => rest;
-const authorize = req => !bridgeToken || req.headers.authorization === `Bearer ${bridgeToken}`;
-const isRateLimited = req => { const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim(); const now = Date.now(); const b = requestBuckets.get(ip); if (!b || now - b.startedAt > 600000) { requestBuckets.set(ip, { startedAt: now, count: 1 }); return false; } return ++b.count > 30; };
-
-const writeUpload = async body => {
-  if (!validId(body?.conversationId)) throw new Error('INVALID_CONVERSATION');
-  const mimeType = String(body?.mimeType || '').toLowerCase();
-  const match = String(body?.dataUrl || '').match(/^data:([^;,]+);base64,([a-zA-Z0-9+/=]+)$/);
-  if (!allowedImageTypes.has(mimeType) || !match || match[1].toLowerCase() !== mimeType) throw new Error('INVALID_IMAGE');
-  const content = Buffer.from(match[2], 'base64');
-  if (!content.length || content.length > maxImageBytes) throw new Error('IMAGE_TOO_LARGE');
-  const ext = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp' }[mimeType];
-  const id = crypto.randomUUID(); const folder = join(uploadsDir, body.conversationId); await mkdir(folder, { recursive: true });
-  const path = join(folder, `${id}${ext}`); await writeFile(path, content, { flag: 'wx' });
-  const attachment = { id, conversationId: body.conversationId, name: safeName(body?.name), mimeType, size: content.length, path, url: `/api/uploads/${id}`, createdAt: Date.now() };
-  const index = await loadUploadIndex(); index[id] = attachment; await saveUploadIndex(index); return attachment;
-};
-const attachedFilesForConversation = async (conversationId, attachments) => {
-  const index = await loadUploadIndex(); if (!Array.isArray(attachments)) return [];
-  return attachments.slice(0, 4).flatMap(item => { const a = index[item?.id]; return a && a.conversationId === conversationId && existsSync(a.path) ? [{ ...a }] : []; });
-};
-
-const describeAttachment = async attachment => {
-  if (attachment?.vision?.description) return attachment.vision.description;
-  if (!visionConfigured) throw new Error('VISION_NOT_CONFIGURED');
-  const image = await readFile(attachment.path); const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 60000);
-  try {
-    const response = await fetch(`${visionBaseUrl}/chat/completions`, { method: 'POST', headers: { authorization: `Bearer ${visionApiKey}`, 'content-type': 'application/json' }, body: JSON.stringify({ model: visionModel, temperature: 0.2, max_tokens: 700, messages: [{ role: 'user', content: [{ type: 'text', text: visionPrompt }, { type: 'image_url', image_url: { url: `data:${attachment.mimeType};base64,${image.toString('base64')}`, detail: 'high' } }] }] }), signal: controller.signal });
-    const result = await response.json().catch(() => ({})); if (!response.ok) throw new Error(result?.error?.message || result?.message || 'VISION_REQUEST_FAILED');
-    const content = result?.choices?.[0]?.message?.content;
-    const description = (typeof content === 'string' ? content : Array.isArray(content) ? content.map(p => p?.text || '').join('') : '').trim();
-    if (!description) throw new Error('VISION_EMPTY_RESPONSE'); return description.slice(0, 1600);
-  } finally { clearTimeout(timeout); }
-};
-const describeAttachments = async attachments => {
-  if (!attachments.length) return {}; const index = await loadUploadIndex(); const descriptions = {};
-  for (const attachment of attachments) { const stored = index[attachment.id]; const source = stored || attachment; const description = source?.vision?.description || await describeAttachment(source); descriptions[attachment.id] = description; if (stored && !stored.vision?.description) index[attachment.id] = { ...stored, vision: { description, model: visionModel, createdAt: Date.now() } }; }
-  await saveUploadIndex(index); return descriptions;
-};
-
-const beijingTime = () => new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', dateStyle: 'full', timeStyle: 'medium' }).format(new Date());
-const buildMessages = ({ conversation, message, attachments, imageDescriptions, memoryContext }) => {
-  const messages = conversation.messages.slice(0, -1).slice(-30).flatMap(entry => {
-    if (!['user', 'assistant'].includes(entry.role)) return [];
-    const imageText = Object.values(entry.imageDescriptions || {}).filter(Boolean).join('；');
-    const text = [entry.text?.trim(), imageText ? `图片识别结果：${imageText}` : ''].filter(Boolean).join('\n');
-    return text ? [{ role: entry.role, content: text.slice(0, 6000) }] : [];
-  });
-  const current = [`当前北京时间：${beijingTime()}`];
-  if (memoryContext) current.push(`已有长期记忆（只作为背景，不要修改）：\n${memoryContext}`);
-  if (attachments.length) current.push(`本轮图片识别结果：\n${attachments.map(a => `- ${a.name}: ${imageDescriptions[a.id] || '未识别'}`).join('\n')}`);
-  current.push(message || '本轮仅发送了图片，请根据图片自然回应。');
-  messages.push({ role: 'user', content: current.join('\n\n') });
-  return messages;
-};
-
-const server = createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://localhost'); const origin = req.headers.origin;
-  if (req.method === 'OPTIONS') { if (!origin || !allowedOrigins.has(origin)) return sendJson(res, 403, { error: 'Origin not allowed' }); res.writeHead(204, { 'access-control-allow-origin': origin, 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'content-type, authorization', 'access-control-max-age': '86400' }); return res.end(); }
-  if (origin && !allowedOrigins.has(origin)) return sendJson(res, 403, { error: 'Origin not allowed' }, origin);
-  if (!authorize(req)) return sendJson(res, 401, { error: 'Unauthorized' }, origin);
-  if (req.method === 'GET' && url.pathname === '/health') return sendJson(res, 200, { ok: true, gateway: { build: 'openai-compatible-2026-09-16-r1', provider: 'openai-compatible', configured: aiConfigured, model: aiModel, warm: true, uptimeMs: Date.now() - runtime.startedAt }, vision: { configured: visionConfigured, model: visionModel }, memory: { configured: nocturneConfigured, mode: nocturneMode } }, origin);
-  if (isRateLimited(req)) return sendJson(res, 429, { error: 'Too many requests' }, origin);
-  const conversationMatch = url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9_-]{8,128})$/);
-  if (req.method === 'GET' && conversationMatch) { const c = await loadConversation(conversationMatch[1]); return sendJson(res, 200, { conversationId: c.id, messages: c.messages, memoryCards: c.memoryCards, updatedAt: c.updatedAt }, origin); }
-  const uploadMatch = url.pathname.match(/^\/api\/(?:uploads|upload|images)\/([a-f0-9-]{36})$/i);
-  if (req.method === 'GET' && uploadMatch) { const index = await loadUploadIndex(); const a = index[uploadMatch[1]]; if (!a || !existsSync(a.path)) return sendJson(res, 404, { error: 'Image not found' }, origin); res.writeHead(200, { 'content-type': a.mimeType, 'cache-control': 'private, max-age=31536000, immutable', 'content-length': a.size }); return createReadStream(a.path).pipe(res); }
-  if (req.method !== 'POST') return sendJson(res, 404, { error: 'Not found' }, origin);
-  runtime.activeRequests++; runtime.lastRequestAt = Date.now();
-  try {
-    if (['/api/uploads','/api/upload','/api/images'].includes(url.pathname)) { const a = await writeUpload(await readJson(req, Math.ceil(maxImageBytes * 1.4) + 131072)); return sendJson(res, 201, { attachment: publicAttachment(a) }, origin); }
-    if (url.pathname === '/api/vision') { const body = await readJson(req); if (!validId(body?.conversationId)) return sendJson(res, 400, { error: 'Invalid conversation' }, origin); const attachments = await attachedFilesForConversation(body.conversationId, body.attachments); if (!attachments.length) return sendJson(res, 400, { error: 'Image required' }, origin); return sendJson(res, 200, { imageDescriptions: await describeAttachments(attachments), model: visionModel }, origin); }
-    if (url.pathname !== '/api/chat') return sendJson(res, 404, { error: 'Not found' }, origin);
-    const body = await readJson(req); const conversationId = body?.conversationId; const message = typeof body?.message === 'string' ? body.message.trim() : '';
-    if (!validId(conversationId)) return sendJson(res, 400, { error: 'Invalid conversation' }, origin);
-    if (message.length > 4000) return sendJson(res, 400, { error: 'Message must be at most 4000 characters' }, origin);
-    const attachments = await attachedFilesForConversation(conversationId, body?.attachments); if (!message && !attachments.length) return sendJson(res, 400, { error: 'Message or image required' }, origin);
-    const conversation = await loadConversation(conversationId); const imageDescriptions = await describeAttachments(attachments);
-    const userMessage = { id: crypto.randomUUID(), role: 'user', text: message, attachments: attachments.map(publicAttachment), imageDescriptions, createdAt: Date.now() }; conversation.messages.push(userMessage);
-    let memoryContext = '', surfacedMemory = '';
-    if (nocturneConfigured) { try { const recalled = await recallMemory(message || attachments.map(a => a.name).join(' ')); memoryContext = recalled.context; surfacedMemory = recalled.surfaced; } catch (e) { console.error('Nocturne recall failed:', e); } }
-    if (surfacedMemory) conversation.memoryCards.push({ id: crypto.randomUUID(), text: surfacedMemory.slice(0, 1200), createdAt: Date.now() });
-    const apiResult = await runModel({ systemPrompt, messages: buildMessages({ conversation, message, attachments, imageDescriptions, memoryContext }) });
-    const payload = parseModelPayload(apiResult.text, attachments); if (!payload.reply) throw new Error('Model returned no visible reply');
-    const assistantMessage = { id: crypto.randomUUID(), role: 'assistant', text: payload.reply, thinking: payload.thinking, imageDescriptions, metrics: apiResult.metrics, model: apiResult.model, createdAt: Date.now() }; conversation.messages.push(assistantMessage); await saveConversation(conversation);
-    return sendJson(res, 200, { userMessage, assistantMessage, memoryCards: conversation.memoryCards, surfacedMemory }, origin);
-  } catch (error) { console.error(error); const code = String(error?.message || ''); const status = code.includes('NOT_CONFIGURED') ? 503 : code === 'PAYLOAD_TOO_LARGE' ? 413 : 500; return sendJson(res, status, { error: status === 503 ? 'AI API not configured' : 'Request failed', detail: process.env.NODE_ENV === 'development' ? code : undefined }, origin); }
-  finally { runtime.activeRequests = Math.max(0, runtime.activeRequests - 1); }
-});
-server.listen(port, '0.0.0.0', () => console.log(`Nook API gateway listening on ${port}; provider=openai-compatible; model=${aiModel || 'not-configured'}`));
+mkdirSync(conversationsDir, { recursive: true }); mkdirSync(uploadsDir, { recursive: true });
+const sendJson=(res,status,value,origin)=>{const headers={'content-type':'application/json; charset=utf-8','cache-control':'no-store'};if(origin&&allowedOrigins.has(origin))headers['access-control-allow-origin']=origin;res.writeHead(status,headers);res.end(JSON.stringify(value));};
+const readJson=async(req,limit=128*1024)=>{const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>limit)throw new Error('PAYLOAD_TOO_LARGE');chunks.push(chunk);}return JSON.parse(Buffer.concat(chunks).toString('utf8'));};
+const validId=value=>typeof value==='string'&&/^[a-zA-Z0-9_-]{8,128}$/.test(value);
+const resolveConversationId=value=>validId(sharedConversationId)?sharedConversationId:(validId(value)?value:null);
+const safeName=value=>basename(String(value||'image')).replace(/[^\w.\-() ]/g,'_').slice(0,120)||'image';
+const readJsonFile=async(path,fallback)=>{try{return JSON.parse(await readFile(path,'utf8'));}catch{return fallback;}};
+const writeJsonAtomic=async(path,value)=>{const tmp=`${path}.${process.pid}.${Date.now()}.tmp`;await writeFile(tmp,JSON.stringify(value),'utf8');await rename(tmp,path);};
+const conversationPath=id=>join(conversationsDir,`${id}.json`); const newConversation=id=>({id,messages:[],memoryCards:[],createdAt:Date.now(),updatedAt:Date.now()});
+const loadConversation=async id=>{const value=await readJsonFile(conversationPath(id),newConversation(id));return value?.id===id?value:newConversation(id);};
+const saveConversation=async c=>{c.messages=Array.isArray(c.messages)?c.messages.slice(-400):[];c.memoryCards=Array.isArray(c.memoryCards)?c.memoryCards.slice(-80):[];c.updatedAt=Date.now();await writeJsonAtomic(conversationPath(c.id),c);};
+const loadUploadIndex=()=>readJsonFile(uploadIndexPath,{}); const saveUploadIndex=index=>writeJsonAtomic(uploadIndexPath,index); const publicAttachment=({path,...rest})=>rest;
+const authorize=req=>!bridgeToken||req.headers.authorization===`Bearer ${bridgeToken}`;
+const isRateLimited=req=>{const ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').split(',')[0].trim();const now=Date.now();const b=requestBuckets.get(ip);if(!b||now-b.startedAt>600000){requestBuckets.set(ip,{startedAt:now,count:1});return false;}return ++b.count>30;};
+const writeUpload=async body=>{const conversationId=resolveConversationId(body?.conversationId);if(!conversationId)throw new Error('INVALID_CONVERSATION');const mimeType=String(body?.mimeType||'').toLowerCase();const match=String(body?.dataUrl||'').match(/^data:([^;,]+);base64,([a-zA-Z0-9+/=]+)$/);if(!allowedImageTypes.has(mimeType)||!match||match[1].toLowerCase()!==mimeType)throw new Error('INVALID_IMAGE');const content=Buffer.from(match[2],'base64');if(!content.length||content.length>maxImageBytes)throw new Error('IMAGE_TOO_LARGE');const ext={'image/jpeg':'.jpg','image/png':'.png','image/gif':'.gif','image/webp':'.webp'}[mimeType];const id=crypto.randomUUID();const folder=join(uploadsDir,conversationId);await mkdir(folder,{recursive:true});const path=join(folder,`${id}${ext}`);await writeFile(path,content,{flag:'wx'});const attachment={id,conversationId,name:safeName(body?.name),mimeType,size:content.length,path,url:`/api/uploads/${id}`,createdAt:Date.now()};const index=await loadUploadIndex();index[id]=attachment;await saveUploadIndex(index);return attachment;};
+const attachedFilesForConversation=async(conversationId,attachments)=>{const index=await loadUploadIndex();if(!Array.isArray(attachments))return[];return attachments.slice(0,4).flatMap(item=>{const a=index[item?.id];return a&&a.conversationId===conversationId&&existsSync(a.path)?[{...a}]:[];});};
+const describeAttachment=async attachment=>{if(attachment?.vision?.description)return attachment.vision.description;if(!visionConfigured)throw new Error('VISION_NOT_CONFIGURED');const image=await readFile(attachment.path);const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),60000);try{const response=await fetch(`${visionBaseUrl}/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${visionApiKey}`,'content-type':'application/json'},body:JSON.stringify({model:visionModel,temperature:.2,max_tokens:700,messages:[{role:'user',content:[{type:'text',text:visionPrompt},{type:'image_url',image_url:{url:`data:${attachment.mimeType};base64,${image.toString('base64')}`,detail:'high'}}]}]}),signal:controller.signal});const result=await response.json().catch(()=>({}));if(!response.ok)throw new Error(result?.error?.message||result?.message||'VISION_REQUEST_FAILED');const content=result?.choices?.[0]?.message?.content;const description=(typeof content==='string'?content:Array.isArray(content)?content.map(p=>p?.text||'').join(''):'').trim();if(!description)throw new Error('VISION_EMPTY_RESPONSE');return description.slice(0,1600);}finally{clearTimeout(timeout);}};
+const describeAttachments=async attachments=>{if(!attachments.length)return{};const index=await loadUploadIndex();const descriptions={};for(const attachment of attachments){const stored=index[attachment.id];const source=stored||attachment;try{const description=source?.vision?.description||await describeAttachment(source);descriptions[attachment.id]=description;if(stored&&!stored.vision?.description)index[attachment.id]={...stored,vision:{description,model:visionModel,createdAt:Date.now()}};}catch(error){console.warn(`Vision unavailable for ${attachment.id}:`,error?.message||error);descriptions[attachment.id]='';}}await saveUploadIndex(index);return descriptions;};
+const beijingTime=()=>new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',dateStyle:'full',timeStyle:'medium'}).format(new Date());
+const buildMessages=({conversation,message,attachments,imageDescriptions,memoryContext})=>{const messages=conversation.messages.slice(0,-1).slice(-30).flatMap(entry=>{if(!['user','assistant'].includes(entry.role))return[];const imageText=Object.values(entry.imageDescriptions||{}).filter(Boolean).join('；');const text=[entry.text?.trim(),imageText?`图片识别结果：${imageText}`:''].filter(Boolean).join('\n');return text?[{role:entry.role,content:text.slice(0,6000)}]:[];});const current=[`当前北京时间：${beijingTime()}`];if(memoryContext)current.push(`已有长期记忆（只作为背景，不要修改）：\n${memoryContext}`);if(attachments.length)current.push(`本轮图片：\n${attachments.map(a=>`- ${a.name}: ${imageDescriptions[a.id]||'图片已收到，但当前视觉模型没有返回识别结果'}`).join('\n')}`);current.push(message||'本轮仅发送了图片，请自然回应；如果没有图片识别结果，不要假装看到了具体内容。');messages.push({role:'user',content:current.join('\n\n')});return messages;};
+const server=createServer(async(req,res)=>{const url=new URL(req.url,'http://localhost');const origin=req.headers.origin;if(req.method==='OPTIONS'){if(!origin||!allowedOrigins.has(origin))return sendJson(res,403,{error:'Origin not allowed'});res.writeHead(204,{'access-control-allow-origin':origin,'access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'content-type, authorization','access-control-max-age':'86400'});return res.end();}if(origin&&!allowedOrigins.has(origin))return sendJson(res,403,{error:'Origin not allowed'},origin);if(!authorize(req))return sendJson(res,401,{error:'Unauthorized'},origin);if(req.method==='GET'&&url.pathname==='/health')return sendJson(res,200,{ok:true,gateway:{build:'openai-compatible-2026-09-16-r2',provider:'openai-compatible',configured:aiConfigured,model:aiModel,warm:true,conversationId:resolveConversationId(null),uptimeMs:Date.now()-runtime.startedAt},vision:{configured:visionConfigured,model:visionModel},memory:{configured:nocturneConfigured,mode:nocturneMode}},origin);if(isRateLimited(req))return sendJson(res,429,{error:'Too many requests'},origin);const conversationMatch=url.pathname.match(/^\/api\/conversations\/([a-zA-Z0-9_-]{8,128})$/);if(req.method==='GET'&&conversationMatch){const id=resolveConversationId(conversationMatch[1]);const c=await loadConversation(id);return sendJson(res,200,{conversationId:c.id,messages:c.messages,memoryCards:c.memoryCards,updatedAt:c.updatedAt},origin);}const uploadMatch=url.pathname.match(/^\/api\/(?:uploads|upload|images)\/([a-f0-9-]{36})$/i);if(req.method==='GET'&&uploadMatch){const index=await loadUploadIndex();const a=index[uploadMatch[1]];if(!a||!existsSync(a.path))return sendJson(res,404,{error:'Image not found'},origin);res.writeHead(200,{'content-type':a.mimeType,'cache-control':'private, max-age=31536000, immutable','content-length':a.size});return createReadStream(a.path).pipe(res);}if(req.method!=='POST')return sendJson(res,404,{error:'Not found'},origin);runtime.activeRequests++;runtime.lastRequestAt=Date.now();try{if(['/api/uploads','/api/upload','/api/images'].includes(url.pathname)){const a=await writeUpload(await readJson(req,Math.ceil(maxImageBytes*1.4)+131072));return sendJson(res,201,{attachment:publicAttachment(a)},origin);}if(url.pathname==='/api/vision'){const body=await readJson(req);const id=resolveConversationId(body?.conversationId);if(!id)return sendJson(res,400,{error:'Invalid conversation'},origin);const attachments=await attachedFilesForConversation(id,body.attachments);if(!attachments.length)return sendJson(res,400,{error:'Image required'},origin);return sendJson(res,200,{imageDescriptions:await describeAttachments(attachments),model:visionModel},origin);}if(url.pathname!=='/api/chat')return sendJson(res,404,{error:'Not found'},origin);const body=await readJson(req);const conversationId=resolveConversationId(body?.conversationId);const message=typeof body?.message==='string'?body.message.trim():'';if(!conversationId)return sendJson(res,400,{error:'Invalid conversation'},origin);if(message.length>4000)return sendJson(res,400,{error:'Message must be at most 4000 characters'},origin);const attachments=await attachedFilesForConversation(conversationId,body?.attachments);if(!message&&!attachments.length)return sendJson(res,400,{error:'Message or image required'},origin);const conversation=await loadConversation(conversationId);const imageDescriptions=await describeAttachments(attachments);const userMessage={id:crypto.randomUUID(),role:'user',text:message,attachments:attachments.map(publicAttachment),imageDescriptions,createdAt:Date.now()};conversation.messages.push(userMessage);let memoryContext='',surfacedMemory='';if(nocturneConfigured){try{const recalled=await recallMemory(message||attachments.map(a=>a.name).join(' '));memoryContext=recalled.context;surfacedMemory=recalled.surfaced;}catch(e){console.error('Nocturne recall failed:',e);}}if(surfacedMemory)conversation.memoryCards.push({id:crypto.randomUUID(),text:surfacedMemory.slice(0,1200),createdAt:Date.now()});const apiResult=await runModel({systemPrompt,messages:buildMessages({conversation,message,attachments,imageDescriptions,memoryContext})});const payload=parseModelPayload(apiResult.text,attachments);if(!payload.reply)throw new Error('Model returned no visible reply');const assistantMessage={id:crypto.randomUUID(),role:'assistant',text:payload.reply,thinking:payload.thinking,imageDescriptions,metrics:apiResult.metrics,model:apiResult.model,createdAt:Date.now()};conversation.messages.push(assistantMessage);await saveConversation(conversation);return sendJson(res,200,{conversationId,userMessage,assistantMessage,memoryCards:conversation.memoryCards,surfacedMemory},origin);}catch(error){console.error(error);const code=String(error?.message||'');const status=code.includes('NOT_CONFIGURED')?503:code==='PAYLOAD_TOO_LARGE'?413:500;return sendJson(res,status,{error:status===503?'AI API not configured':'Request failed',detail:process.env.NODE_ENV==='development'?code:undefined},origin);}finally{runtime.activeRequests=Math.max(0,runtime.activeRequests-1);}});server.listen(port,'0.0.0.0',()=>console.log(`Nook API gateway listening on ${port}; provider=openai-compatible; model=${aiModel||'not-configured'}; conversation=${resolveConversationId(null)||'invalid'}`));
