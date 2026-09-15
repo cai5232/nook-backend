@@ -4,29 +4,28 @@ export const aiModel = String(process.env.AI_MODEL || '').trim();
 export const aiConfigured = Boolean(apiKey && aiBaseUrl && aiModel);
 
 const metricsFromUsage = (usage = {}) => {
+  // Anthropic-style usage reports uncached input separately from cache reads/writes.
+  // Some OpenAI-compatible relays instead include cached tokens inside prompt_tokens.
+  // Keep the raw prompt count, but use an Anthropic-aware denominator for ZenMux cache metrics.
   const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
   const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
+  const openAiCachedTokens = usage?.prompt_tokens_details?.cached_tokens;
   const cacheReadTokens = Number(
-    usage?.prompt_tokens_details?.cached_tokens ??
+    openAiCachedTokens ??
     usage.cache_read_input_tokens ??
     usage.input_cache_read ??
     usage.cache_read ??
     usage.cacheReadInputTokens ??
     0
   ) || 0;
-  const cacheCreatedTokens = Number(
-    usage.cache_creation_input_tokens ??
-    usage.cache_creation_tokens ??
-    usage.input_cache_write ??
-    usage.input_cache_write_5_min ??
-    usage.input_cache_write_1_h ??
-    usage.cache_write ??
-    usage.cacheCreatedInputTokens ??
-    0
-  ) || 0;
-  const denominator = inputTokens || (cacheReadTokens + cacheCreatedTokens);
-  const hasCacheMetrics =
-    usage?.prompt_tokens_details?.cached_tokens != null ||
+
+  const explicitCacheWrite = usage.cache_creation_input_tokens ?? usage.cache_creation_tokens ?? usage.input_cache_write ?? usage.cache_write ?? usage.cacheCreatedInputTokens;
+  const timedCacheWrite =
+    (Number(usage.input_cache_write_5_min) || 0) +
+    (Number(usage.input_cache_write_1_h) || 0);
+  const cacheCreatedTokens = Number(explicitCacheWrite ?? timedCacheWrite) || 0;
+
+  const hasAnthropicCacheMetrics =
     usage.cache_read_input_tokens != null ||
     usage.cache_creation_input_tokens != null ||
     usage.cache_creation_tokens != null ||
@@ -36,13 +35,25 @@ const metricsFromUsage = (usage = {}) => {
     usage.input_cache_write_1_h != null ||
     usage.cache_read != null ||
     usage.cache_write != null;
+  const hasOpenAiCacheMetrics = openAiCachedTokens != null;
+  const hasCacheMetrics = hasAnthropicCacheMetrics || hasOpenAiCacheMetrics;
+
+  // ZenMux/Anthropic: prompt/input is the uncached portion, so cached reads/writes
+  // must be added to get the full logical input. OpenAI-style prompt_tokens already
+  // includes cached tokens, so do not add them again there.
+  const logicalInputTokens = hasAnthropicCacheMetrics
+    ? inputTokens + cacheReadTokens + cacheCreatedTokens
+    : inputTokens;
+  const rawRate = logicalInputTokens > 0 ? cacheReadTokens / logicalInputTokens : 0;
+  const cacheRate = hasCacheMetrics ? Math.min(1, Math.max(0, rawRate)) : null;
+
   return {
-    tokens: Number(usage.total_tokens) || inputTokens + outputTokens,
-    inputTokens,
+    tokens: Number(usage.total_tokens) || logicalInputTokens + outputTokens,
+    inputTokens: logicalInputTokens,
     outputTokens,
     cacheReadTokens,
     cacheCreatedTokens,
-    cacheRate: hasCacheMetrics && denominator ? cacheReadTokens / denominator : null
+    cacheRate
   };
 };
 
