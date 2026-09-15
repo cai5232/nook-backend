@@ -5,23 +5,58 @@ export const aiBaseUrl=String(process.env.AI_BASE_URL||'').trim().replace(/\/+$/
 export const aiModel=String(process.env.AI_MODEL||'').trim();
 export const aiConfigured=Boolean(apiKey&&aiBaseUrl&&aiModel);
 const num=v=>Number.isFinite(Number(v))?Number(v):null;
-const metricsFromUsage=(usage={})=>{const inputTokens=num(usage.prompt_tokens??usage.input_tokens)??0,outputTokens=num(usage.completion_tokens??usage.output_tokens)??0,openAiCached=num(usage?.prompt_tokens_details?.cached_tokens),cacheReadTokens=openAiCached??num(usage.cache_read_input_tokens??usage.input_cache_read??usage.cache_read??usage.cacheReadInputTokens)??0,explicitWrite=num(usage.cache_creation_input_tokens??usage.cache_creation_tokens??usage.input_cache_write??usage.cache_write??usage.cacheCreatedInputTokens),timedWrite=(num(usage.input_cache_write_5_min)??0)+(num(usage.input_cache_write_1_h)??0),cacheCreatedTokens=explicitWrite??timedWrite,anthropic=usage.cache_read_input_tokens!=null||usage.cache_creation_input_tokens!=null||usage.cache_creation_tokens!=null||usage.input_cache_read!=null||usage.input_cache_write!=null||usage.input_cache_write_5_min!=null||usage.input_cache_write_1_h!=null||usage.cache_read!=null||usage.cache_write!=null,hasCache=anthropic||openAiCached!=null,logical=anthropic?inputTokens+cacheReadTokens+cacheCreatedTokens:inputTokens;
-  // Prefer a provider-supplied hit rate when ZenMux exposes one; otherwise use exactly
-  // ZenMux's displayed formula: cache_read / (prompt + cache_read + cache_write).
+
+const metricsFromUsage=(usage={})=>{
+  const prompt=num(usage.prompt_tokens??usage.input_tokens)??0;
+  const output=num(usage.completion_tokens??usage.output_tokens)??0;
+  const anthropicRead=num(usage.cache_read_input_tokens??usage.input_cache_read??usage.cache_read??usage.cacheReadInputTokens);
+  const openAiRead=num(usage?.prompt_tokens_details?.cached_tokens);
+  const cacheRead=anthropicRead??openAiRead??0;
+  const explicitWrite=num(usage.cache_creation_input_tokens??usage.cache_creation_tokens??usage.input_cache_write??usage.cache_write??usage.cacheCreatedInputTokens);
+  const timedWrite=(num(usage.input_cache_write_5_min)??0)+(num(usage.input_cache_write_1_h)??0);
+  const cacheWrite=explicitWrite??timedWrite;
+  const logical=prompt+cacheRead+cacheWrite;
   const providerRate=num(usage.cache_hit_rate??usage.cacheHitRate);
-  const normalizedProviderRate=providerRate==null?null:(providerRate>1?providerRate/100:providerRate);
-  const cacheRate=normalizedProviderRate??(hasCache&&logical>0?cacheReadTokens/logical:null);
-  return{tokens:num(usage.total_tokens)??logical+outputTokens,inputTokens:logical,uncachedInputTokens:inputTokens,outputTokens,cacheReadTokens,cacheCreatedTokens,cacheRate:cacheRate==null?null:Math.max(0,Math.min(1,cacheRate))};};
+  const normalizedProvider=providerRate==null?null:(providerRate>1?providerRate/100:providerRate);
+  const computed=logical>0?cacheRead/logical:null;
+  const rate=normalizedProvider??computed;
+  return {tokens:num(usage.total_tokens)??logical+output,inputTokens:logical,uncachedInputTokens:prompt,outputTokens:output,cacheReadTokens:cacheRead,cacheCreatedTokens:cacheWrite,cacheRate:rate==null?null:Math.max(0,Math.min(1,rate))};
+};
+
 const contentText=content=>typeof content==='string'?content:Array.isArray(content)?content.map(p=>typeof p==='string'?p:(p?.text||'')).join('').trim():'';
 const hash=v=>createHash('sha256').update(String(v??'')).digest('hex').slice(0,16);
 const cacheEnabled=()=>{const v=String(process.env.AI_PROMPT_CACHE||'').trim().toLowerCase();if(['0','false','off','no'].includes(v))return false;if(['1','true','on','yes'].includes(v))return true;return /(^|\/)claude(?:-|$)/i.test(aiModel)||/anthropic/i.test(aiModel);};
 const cacheBlock=content=>{const blocks=Array.isArray(content)?content.map(p=>typeof p==='string'?{type:'text',text:p}:{...p}):[{type:'text',text:String(content??'')}];if(blocks.length)blocks[blocks.length-1]={...blocks[blocks.length-1],cache_control:{type:'ephemeral'}};return blocks;};
 const cachedSystemContent=p=>cacheEnabled()?cacheBlock(p):p;
 
-// Explicitly mark several stable-history checkpoints instead of only the moving tail.
-// This gives Claude/ZenMux multiple reusable anchors while keeping the current dynamic
-// user turn completely outside the cache. Max explicit breakpoints kept at four total:
-// system + up to three history checkpoints.
-const withConversationBreakpoints=messages=>{if(!cacheEnabled()||!Array.isArray(messages)||messages.length<2)return messages;const copy=messages.map(m=>({...m,content:Array.isArray(m.content)?m.content.map(p=>typeof p==='object'&&p?{...p}:p):m.content})),stableCount=copy.length-1;if(stableCount<=0)return copy;const candidates=[Math.floor(stableCount/3)-1,Math.floor(stableCount*2/3)-1,stableCount-1].filter(i=>i>=0&&i<stableCount);for(const i of [...new Set(candidates)]){const target=copy[i];if(target&&['user','assistant'].includes(target.role))target.content=cacheBlock(target.content);}return copy;};
-const diagnostics=(systemPrompt,messages)=>{const stable=Array.isArray(messages)&&messages.length>1?messages.slice(0,-1):[],text=stable.map(m=>`${m.role}:${contentText(m.content)}`).join('\n');return{systemHash:hash(systemPrompt),systemChars:String(systemPrompt??'').length,historyHash:hash(text),historyChars:text.length,stableMessages:stable.length};};
-export const runModel=async({systemPrompt,messages})=>{if(!aiConfigured)throw new Error('AI_NOT_CONFIGURED');const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),Number(process.env.AI_TIMEOUT_MS)||120000),diag=diagnostics(systemPrompt,messages),requestMessages=[{role:'system',content:cachedSystemContent(systemPrompt)},...withConversationBreakpoints(messages)];console.log('[prompt-cache request]',JSON.stringify({model:aiModel,cacheEnabled:cacheEnabled(),...diag}));try{const response=await fetch(`${aiBaseUrl}/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${apiKey}`,'content-type':'application/json'},body:JSON.stringify({model:aiModel,messages:requestMessages,temperature:Number(process.env.AI_TEMPERATURE??.8),max_tokens:Number(process.env.AI_MAX_TOKENS)||1800}),signal:controller.signal}),result=await response.json().catch(()=>({}));if(!response.ok)throw new Error(result?.error?.message||result?.message||`AI_REQUEST_FAILED_${response.status}`);const text=contentText(result?.choices?.[0]?.message?.content);if(!text)throw new Error('AI_EMPTY_RESPONSE');const metrics=metricsFromUsage(result?.usage||{});console.log('[prompt-cache usage]',JSON.stringify({prompt:metrics.uncachedInputTokens,cache_read:metrics.cacheReadTokens,cache_write:metrics.cacheCreatedTokens,cache_hit_rate:metrics.cacheRate==null?null:Number((metrics.cacheRate*100).toFixed(2)),...diag}));return{text,model:result?.model||aiModel,metrics};}finally{clearTimeout(timeout);}};
+// BP4 follows the reference layout: one rolling breakpoint on the last stable
+// historical message. The current volatile user input stays after the boundary.
+const withRollingBP4=messages=>{
+  if(!cacheEnabled()||!Array.isArray(messages)||messages.length<2)return messages;
+  const copy=messages.map(m=>({...m,content:Array.isArray(m.content)?m.content.map(p=>typeof p==='object'&&p?{...p}:p):m.content}));
+  const index=copy.length-2;
+  const target=copy[index];
+  if(target&&['user','assistant'].includes(target.role))target.content=cacheBlock(target.content);
+  return copy;
+};
+
+const diagnostics=(systemPrompt,messages)=>{const stable=Array.isArray(messages)&&messages.length>1?messages.slice(0,-1):[],text=stable.map(m=>`${m.role}:${contentText(m.content)}`).join('\n');return{systemHash:hash(systemPrompt),systemChars:String(systemPrompt??'').length,historyHash:hash(text),historyChars:text.length,stableMessages:stable.length,bp4Index:stable.length?stable.length-1:null};};
+
+export const runModel=async({systemPrompt,messages})=>{
+  if(!aiConfigured)throw new Error('AI_NOT_CONFIGURED');
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),Number(process.env.AI_TIMEOUT_MS)||120000);
+  const diag=diagnostics(systemPrompt,messages);
+  const requestMessages=[{role:'system',content:cachedSystemContent(systemPrompt)},...withRollingBP4(messages)];
+  console.log('[prompt-cache request]',JSON.stringify({model:aiModel,cacheEnabled:cacheEnabled(),...diag}));
+  try{
+    const response=await fetch(`${aiBaseUrl}/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${apiKey}`,'content-type':'application/json'},body:JSON.stringify({model:aiModel,messages:requestMessages,temperature:Number(process.env.AI_TEMPERATURE??.8),max_tokens:Number(process.env.AI_MAX_TOKENS)||1800}),signal:controller.signal});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(result?.error?.message||result?.message||`AI_REQUEST_FAILED_${response.status}`);
+    const text=contentText(result?.choices?.[0]?.message?.content);
+    if(!text)throw new Error('AI_EMPTY_RESPONSE');
+    const metrics=metricsFromUsage(result?.usage||{});
+    console.log('[prompt-cache usage]',JSON.stringify({prompt:metrics.uncachedInputTokens,cache_read:metrics.cacheReadTokens,cache_write:metrics.cacheCreatedTokens,cache_hit_rate:metrics.cacheRate==null?null:Number((metrics.cacheRate*100).toFixed(2)),...diag}));
+    return{text,model:result?.model||aiModel,metrics};
+  }finally{clearTimeout(timeout);}
+};
