@@ -1,6 +1,6 @@
 {
   "name": "nook-backend",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "build": "node --check src/server.mjs && node --check src/gateway/anthropic.mjs && node --check src/gateway/payload.mjs && node --check nocturne-client.mjs",
+    "build": "node --check src/server.mjs && node --check src/prompts.mjs && node --check src/gateway/openai-compatible.mjs && node --check src/gateway/payload.mjs && node --check nocturne-client.mjs",
     "test": "node --test"
   }
 }
