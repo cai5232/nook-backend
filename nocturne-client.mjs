@@ -5,8 +5,6 @@ const rawUrl = String(process.env.NOCTURNE_API_URL || '').trim();
 const token = String(process.env.NOCTURNE_API_TOKEN || '').trim();
 const timeoutMs = positiveInt(process.env.NOCTURNE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
 const contextChars = positiveInt(process.env.NOCTURNE_CONTEXT_CHARS, DEFAULT_CONTEXT_CHARS);
-// Keep the prompt focused: the memory service already ranks matches, and Nook
-// only needs a few of the strongest ones for a natural reply.
 const recallLimit = positiveInt(process.env.NOCTURNE_RECALL_LIMIT, 4);
 
 function positiveInt(value, fallback) {
@@ -67,32 +65,40 @@ function compactEventText(value, limit = 240) {
     .slice(0, limit);
 }
 
+function memoryText(item) {
+  if (typeof item === 'string') return item.trim();
+  if (!item || typeof item !== 'object') return '';
+  return String(item.content ?? item.text ?? item.memory ?? item.summary ?? '').trim();
+}
+
 function normalizeRecall(payload) {
-  const core = String(payload?.core || '').trim();
-  const related = Array.isArray(payload?.memories)
-    ? payload.memories.map((item) => typeof item === 'string' ? item : item?.content || item?.text || '').filter(Boolean).join('\n\n')
-    : String(payload?.related || '').trim();
-  const suppliedContext = String(payload?.context || '').trim();
+  const root = payload?.data && typeof payload.data === 'object' ? payload.data : payload || {};
+  const core = memoryText(root.core ?? root.coreMemory ?? root.core_memory);
+  const list = Array.isArray(root.memories) ? root.memories : Array.isArray(root.results) ? root.results : Array.isArray(root.related) ? root.related : [];
+  const related = list.map(memoryText).filter(Boolean).join('\n\n') || (typeof root.related === 'string' ? root.related.trim() : '');
+  const suppliedContext = String(root.context ?? root.memoryContext ?? root.memory_context ?? '').trim();
   const sections = [];
   if (core) sections.push(`【核心记忆】\n${core}`);
   if (related) sections.push(`【与当前消息相关的记忆】\n${related}`);
   if (!sections.length && suppliedContext) sections.push(suppliedContext);
   return {
     context: sections.join('\n\n').slice(0, contextChars),
-    // A visible "memory surfaced" event is opt-in on the server. Falling
-    // back to every related/core item made the UI imply a recall on every turn.
-    surfaced: compactEventText(payload?.surfaced),
+    surfaced: compactEventText(root.surfaced ?? root.surfacedMemory ?? root.surfaced_memory),
+    matches: list.length,
   };
 }
 
 export async function recallMemory(query) {
-  if (!apiUrl) return { context: '', surfaced: '' };
+  if (!apiUrl) return { context: '', surfaced: '', matches: 0 };
+  const q = String(query || '').slice(0, 800);
   const payload = await post('/api/integrations/nook/recall', {
-    query: String(query || '').slice(0, 800),
+    query: q,
     limit: recallLimit,
     contextChars,
   });
-  return normalizeRecall(payload);
+  const normalized = normalizeRecall(payload);
+  console.log('[nocturne-recall]', JSON.stringify({queryChars:q.length, matches:normalized.matches, contextChars:normalized.context.length, surfacedChars:normalized.surfaced.length, responseKeys:Object.keys(payload || {}).slice(0,12)}));
+  return normalized;
 }
 
 export async function storeMemory({
