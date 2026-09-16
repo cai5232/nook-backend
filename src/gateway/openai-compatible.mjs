@@ -56,7 +56,7 @@ export const runModel=async({systemPrompt,messages})=>{
   const requestMessages=[{role:'system',content:cachedSystemContent(systemPrompt)},...withStableCacheBreakpoint(messages)];
   console.log('[prompt-cache request]',JSON.stringify({model:aiModel,cacheEnabled:cacheEnabled(),...diag}));
   try{
-    const response=await fetch(`${aiBaseUrl}/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${apiKey}`,'content-type':'application/json'},body:JSON.stringify({model:aiModel,messages:requestMessages,temperature:Number(process.env.AI_TEMPERATURE??.8),max_tokens:Number(process.env.AI_MAX_TOKENS)||1800}),signal:controller.signal});
+    const response=await fetch(`${aiBaseUrl}/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${apiKey}`,'content-type':'application/json'},body:JSON.stringify({model:aiModel,messages:requestMessages,temperature:Number(process.env.AI_TEMPERATURE??.8),max_tokens:Number(process.env.AI_MAX_TOKENS)||4000}),signal:controller.signal});
     const result=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(result?.error?.message||result?.message||`AI_REQUEST_FAILED_${response.status}`);
     const text=contentText(result?.choices?.[0]?.message?.content);
