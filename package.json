@@ -7,8 +7,8 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "start": "node src/server.mjs",
-    "build": "node --check src/server.mjs && node --check src/prompts.mjs && node --check src/gateway/openai-compatible.mjs && node --check src/gateway/payload.mjs && node --check nocturne-client.mjs",
+    "start": "node src/runtime-entry.mjs",
+    "build": "node --check src/runtime-entry.mjs && node --check src/server.mjs && node --check src/prompts.mjs && node --check src/gateway/openai-compatible.mjs && node --check src/gateway/memory-compression.mjs && node --check src/gateway/payload.mjs && node --check nocturne-client.mjs",
     "test": "node --test"
   }
 }
