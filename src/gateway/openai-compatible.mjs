@@ -47,6 +47,7 @@ const withStableCacheBreakpoint=messages=>{
 };
 
 const diagnostics=(systemPrompt,messages)=>{const stable=Array.isArray(messages)&&messages.length>1?messages.slice(0,-1):[],text=stable.map(m=>`${m.role}:${contentText(m.content)}`).join('\n');return{systemHash:hash(systemPrompt),systemChars:String(systemPrompt??'').length,historyHash:hash(text),historyChars:text.length,stableMessages:stable.length,bp4Index:stableBreakpointIndex(messages)};};
+const requestModel=async({body,signal})=>{const response=await fetch(`${aiBaseUrl}/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${apiKey}`,'content-type':'application/json'},body:JSON.stringify(body),signal});const result=await response.json().catch(()=>({}));return{response,result};};
 
 export const runModel=async({systemPrompt,messages})=>{
   if(!aiConfigured)throw new Error('AI_NOT_CONFIGURED');
@@ -56,8 +57,17 @@ export const runModel=async({systemPrompt,messages})=>{
   const requestMessages=[{role:'system',content:cachedSystemContent(systemPrompt)},...withStableCacheBreakpoint(messages)];
   console.log('[prompt-cache request]',JSON.stringify({model:aiModel,cacheEnabled:cacheEnabled(),...diag}));
   try{
-    const response=await fetch(`${aiBaseUrl}/chat/completions`,{method:'POST',headers:{authorization:`Bearer ${apiKey}`,'content-type':'application/json'},body:JSON.stringify({model:aiModel,messages:requestMessages,temperature:Number(process.env.AI_TEMPERATURE??.8),max_tokens:Number(process.env.AI_MAX_TOKENS)||4000}),signal:controller.signal});
-    const result=await response.json().catch(()=>({}));
+    let body={model:aiModel,messages:requestMessages,max_tokens:Number(process.env.AI_MAX_TOKENS)||4000};
+    const configuredTemperature=process.env.AI_TEMPERATURE;
+    if(configuredTemperature!==undefined&&configuredTemperature!=='')body.temperature=Number(configuredTemperature);
+    let {response,result}=await requestModel({body,signal:controller.signal});
+    // Some newer/reasoning models reject temperature or the legacy max_tokens field.
+    // Retry once with the broadly supported completion-token form instead of making
+    // the whole gateway model-dependent.
+    if(!response.ok&&/temperature|max_tokens|unsupported parameter|invalid parameter/i.test(String(result?.error?.message||result?.message||''))){
+      body={model:aiModel,messages:requestMessages,max_completion_tokens:Number(process.env.AI_MAX_TOKENS)||4000};
+      ({response,result}=await requestModel({body,signal:controller.signal}));
+    }
     if(!response.ok)throw new Error(result?.error?.message||result?.message||`AI_REQUEST_FAILED_${response.status}`);
     const text=contentText(result?.choices?.[0]?.message?.content);
     if(!text)throw new Error('AI_EMPTY_RESPONSE');
