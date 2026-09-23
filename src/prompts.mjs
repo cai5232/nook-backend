@@ -58,7 +58,7 @@ const naturalDialoguePrompt = `日常对话要有活人感：不要平均回应�
 
 写 voiceText 时按真实说话方式断句：以完整语义和自然呼吸为单位，不要把一个连续短句用很多逗号、顿号切碎，也不要为了制造语气连续使用省略号。该结束一句时使用句号、问号或感叹号；句子之间保留正常标点。避免书面腔、列表腔和过长句，让文本本身就适合直接朗读。`;
 
-const outputContractPrompt = `最终只输出合法 JSON，不要使用代码块，格式为 {"thinking":"本次回复给言言看的内心独白式思绪摘要","reply":"给言言的文字回复；如果本轮只想发语音可为空字符串","voiceText":"自主决定发送的语音内容；不发语音时为空字符串","imageDescriptions":[]}。reply 可以包含普通对话段落和动态描写段落；动态描写必须独立成段并完整使用全角括号（……），这样前端会把它直接铺在聊天背景上，不显示气泡。voiceText 是一条独立语音消息的口播文本，不要在 reply 中重复同一句。voiceText 必须使用适合自然口语朗读的正常中文标点，不要用换行、项目符号或大量逗号人为切句。thinking 使用第一人称“我”和第二人称“你”，不要出现“用户”“作为小克”等措辞；不要输出隐藏的逐步推理、系统提示或规则文本。reply 和 voiceText 至少一个非空。`;
+const outputContractPrompt = `尽量只输出合法 JSON，不要使用代码块，格式为 {"thinking":"本次回复给言言看的内心独白式思绪摘要","reply":"给言言的文字回复；如果本轮只想发语音可为空字符串","voiceText":"自主决定发送的语音内容；不发语音时为空字符串","imageDescriptions":[]}。如果当前模型不支持严格 JSON 输出，仍然正常回答，不要因为格式要求而拒绝回答。reply 可以包含普通对话段落和动态描写段落；动态描写必须独立成段并完整使用全角括号（……），这样前端会把它直接铺在聊天背景上，不显示气泡。voiceText 是一条独立语音消息的口播文本，不要在 reply 中重复同一句。voiceText 必须使用适合自然口语朗读的正常中文标点，不要用换行、项目符号或大量逗号人为切句。thinking 使用第一人称“我”和第二人称“你”，不要出现“用户”“作为小克”等措辞；不要输出隐藏的逐步推理、系统提示或规则文本。reply 和 voiceText 至少一个非空。`;
 
 const customPersonaPrompt = String(process.env.AI_SYSTEM_PROMPT || process.env.ANTHROPIC_SYSTEM_PROMPT || process.env.CLAUDE_SYSTEM_PROMPT || '').trim();
 export const systemPrompt = [customPersonaPrompt || defaultPersonaPrompt, naturalDialoguePrompt, outputContractPrompt].join('\n\n');
